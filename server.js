@@ -15,34 +15,54 @@ const apiRoutes = require("./routes/api");
 
 const app = express();
 
+// ==================== CORS CONFIG ====================
+const allowedOrigins = [
+    'https://aquawatch-flax-nine.vercel.app',
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:3001'
+];
+
 const corsOptions = {
-    origin: process.env.NODE_ENV === 'production'
-        ? ['https://your-frontend-domain.com', 'https://aquawatch-flax-nine.vercel.app']
-        : ['http://localhost:3000', 'http://localhost:5173'],
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            console.warn(`[CORS] Blocked origin: ${origin}`);
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-    exposedHeaders: ['Content-Length', 'X-Request-Id']
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
+    exposedHeaders: ['Content-Length', 'X-Request-Id'],
+    optionsSuccessStatus: 204
 };
 
 app.use(cors(corsOptions));
+// ===================================================
+
 app.use(express.json());
 app.use("/api", apiRoutes);
 
+// 404 handler
 app.use("/api", (req, res) => {
   res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` });
 });
 
-
+// Global error handler
 app.use((err, req, res, next) => {
   console.error("[api error]", err);
   res.status(err.status || 500).json({ error: err.message || "Internal server error" });
 });
 
 const server = http.createServer(app);
+
+// Socket.IO with same allowed origins
 const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN || "*",
+    origin: allowedOrigins,
+    credentials: true,
     methods: ["GET", "POST"]
   }
 });
@@ -50,6 +70,7 @@ const io = new Server(server, {
 (async () => {
   try {
     await initDb();
+    console.log("[db] Database initialized successfully");
   } catch (err) {
     console.error("[db] init failed (continuing without persistence):", err.message);
   }
