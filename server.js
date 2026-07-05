@@ -15,7 +15,7 @@ const apiRoutes = require("./routes/api");
 
 const app = express();
 
-// ==================== CORS CONFIG ====================
+// ==================== FIXED CORS ====================
 const allowedOrigins = [
     'https://aquawatch-flax-nine.vercel.app',
     'http://localhost:3000',
@@ -41,28 +41,23 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 // ===================================================
-
 app.use(express.json());
 app.use("/api", apiRoutes);
 
-// 404 handler
 app.use("/api", (req, res) => {
   res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` });
 });
 
-// Global error handler
+
 app.use((err, req, res, next) => {
   console.error("[api error]", err);
   res.status(err.status || 500).json({ error: err.message || "Internal server error" });
 });
 
 const server = http.createServer(app);
-
-// Socket.IO with same allowed origins
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
-    credentials: true,
+    origin: process.env.CORS_ORIGIN || "*",
     methods: ["GET", "POST"]
   }
 });
@@ -70,7 +65,6 @@ const io = new Server(server, {
 (async () => {
   try {
     await initDb();
-    console.log("[db] Database initialized successfully");
   } catch (err) {
     console.error("[db] init failed (continuing without persistence):", err.message);
   }
