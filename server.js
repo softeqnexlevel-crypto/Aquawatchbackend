@@ -14,23 +14,26 @@ const { initDb } = require("./database/postgres");
 const apiRoutes = require("./routes/api");
 
 const app = express();
-app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
+
+const corsOptions = {
+    origin: process.env.NODE_ENV === 'production'
+        ? ['https://your-frontend-domain.com', 'https://aquawatch-flax-nine.vercel.app/']
+        : ['http://localhost:3000', 'http://localhost:5173'],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+    exposedHeaders: ['Content-Length', 'X-Request-Id']
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use("/api", apiRoutes);
 
-// FIX: Express's built-in 404 page is HTML ("Cannot GET /api/...").
-// Your frontend does `await response.json()` on every response, so an
-// unmatched route was crashing the client with "Unexpected token '<'".
-// This catches anything under /api that didn't match a real route and
-// guarantees JSON back instead.
 app.use("/api", (req, res) => {
   res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` });
 });
 
-// FIX: global error handler — if any route handler throws (including inside
-// async functions wrapped without try/catch), Express's default behavior
-// is to render an HTML stack trace page. This ensures API consumers always
-// get JSON, even on a 500.
+
 app.use((err, req, res, next) => {
   console.error("[api error]", err);
   res.status(err.status || 500).json({ error: err.message || "Internal server error" });
