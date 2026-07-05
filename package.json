@@ -1,0 +1,26 @@
+{
+  "name": "water-management-backend",
+  "version": "1.0.0",
+  "description": "MQTT -> Socket.IO ingestion service for PLC water management data",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "drizzle-orm": "^1.0.0-rc.4",
+    "express": "^4.19.2",
+    "mqtt": "^5.10.1",
+    "paseto": "^3.1.4",
+    "pg": "^8.22.0",
+    "socket.io": "^4.8.1",
+    "uuid": "^14.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
