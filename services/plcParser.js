@@ -1,47 +1,5 @@
 'use strict';
 
-/**
- * plcService.js (double-hex decode + named-record parser)
- *
- * ROOT CAUSE FOUND: the incoming MQTT payload is HEX-ENCODED TWICE.
- *   Level 0 (raw MQTT payload):  ASCII text of hex digits
- *   Level 1 (hex-decode once):   ANOTHER ASCII text of hex digits
- *   Level 2 (hex-decode again):  the real binary record structure
- *
- * At level 2, each tag reading is a fixed-ish binary record:
- *   D8 00 00 00                  4-byte marker (constant)
- *   XX XX XX XX                  4-byte big-endian record index (0,1,2,...)
- *   00 00 00                     3 reserved bytes
- *   06                           1-byte type code
- *   04                           1-byte value length (4 = float32)
- *   XX XX XX XX                  4-byte float32, LITTLE-ENDIAN  <-- the actual reading
- *   LL                           1-byte name length
- *   ...name (LL bytes, ASCII)... e.g. "siemens200smart-Permeateflow"
- *   UU                           1-byte unit length
- *   ...unit (UU bytes, ASCII)... e.g. "M3/h", "bar", "%"
- *   (trailer bytes before next D8 marker, ignored)
- *
- * This is what was producing values like 6.4e-10 before: the old code ran a
- * float-search heuristic directly on the (still double-hex-encoded) payload,
- * which is meaningless noise until BOTH hex layers are removed.
- *
- * This version:
- *  1. Always logs the raw payload (hex + ascii) so you can see exactly what arrived.
- *  2. Peels both hex layers deterministically (with graceful fallback if a payload
- *     only has one layer, or none, so it still works if the device firmware changes).
- *  3. Parses named records directly by marker+index (self-correcting by +/-1-2 bytes
- *     if a device firmware quirk shifts a name length off by one, which does happen
- *     on at least one field observed in captured payloads).
- *  4. Falls back to the old D-code/calibration heuristics only if no named records
- *     are found, so nothing is lost for other payload shapes you may still receive.
- *
- * Env:
- *  - DEBUG_PARSE=1        : verbose logs (parser internals, hexdump, candidates)
- *  - LOG_RAW=0             : set to 0 to DISABLE the unconditional raw hex/ascii log
- *  - ARCHIVE_RAW_FAILED=1  : persist raw failed/unparsed payloads to ./data/raw_payloads
- *  - CALIBRATION_FILE      : path to legacy calibration JSON (default ./data/calibration.json)
- *  - MIN_VALID_ABS_VALUE   : threshold to treat tiny parsed values as invalid (default 1e-6)
- */
 
 const fs = require('fs');
 const path = require('path');

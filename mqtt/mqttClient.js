@@ -6,11 +6,9 @@ let simulationInterval = null;
 let isSimulationMode = false;
 
 function initMqtt() {
-  const url = process.env.MQTT_BROKER || process.env.MQTT_URL || "mqtt://localhost:1883";
-  // "RO5" — letter O, not zero. Confirmed from the A-Box gateway's own
-  // topic convention (e.g. "RO5/FEEDFlow"). The old default here was
-  // "R05" (zero), which would silently subscribe to the wrong topic
-  // even on a successful connection.
+  const url = process.env.MQTT_BROKER || process.env.MQTT_URL || "mqtt://broker.emqx.io:1883" 
+   
+
   const root = process.env.MQTT_TOPIC_ROOT || "RO5";
 
   // Simulation is opt-in ONLY now. It used to auto-activate on any
@@ -86,9 +84,7 @@ function startSimulation() {
 function generateSimulatedData() {
   const timestamp = new Date().toISOString();
 
-  // This array was commented out before while the code below still
-  // referenced it — that threw "simulatedTopics is not defined" the
-  // instant simulation mode started.
+  
   const simulatedTopics = [
     { topic: "RO5/FEEDFlow", value: 100 + (Math.random() - 0.5) * 10 },
     { topic: "RO5/Permeateflow", value: 75 + (Math.random() - 0.5) * 5 },
