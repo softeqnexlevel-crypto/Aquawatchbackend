@@ -15,7 +15,7 @@ const apiRoutes = require("./routes/api");
 
 const app = express();
 
-// ==================== FIXED CORS ====================
+// ==================== CORS CONFIG ====================
 const allowedOrigins = [
     'https://aquawatch-flax-nine.vercel.app',
     'http://localhost:3000',
@@ -25,13 +25,10 @@ const allowedOrigins = [
 
 const corsOptions = {
     origin: (origin, callback) => {
-        // Handle server-to-server or curl requests (origin is undefined)
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
-            console.warn(`[CORS] Rejected origin block: ${origin}`);
-            // ✅ FIX: Pass 'false' instead of an Error object. 
-            // Passing an Error crashes the preflight options pipeline, resulting in "Failed to fetch".
+            console.warn(`[CORS] Blocked origin: ${origin}`);
             callback(null, false);
         }
     },
@@ -39,31 +36,37 @@ const corsOptions = {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
     exposedHeaders: ['Content-Length', 'X-Request-Id'],
-    optionsSuccessStatus: 200 // Some legacy browsers choke on 204
+    optionsSuccessStatus: 200
 };
 
-// Apply CORS options globally
 app.use(cors(corsOptions));
-// Automatically handle preflight OPTIONS requests across all routes
-app.options('*', cors(corsOptions));
+app.options('*', cors(corsOptions));   // Explicitly handle preflight
 // ===================================================
+
 app.use(express.json());
 app.use("/api", apiRoutes);
 
-app.use("/api", (req, res) => {
-  res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` });
+// 404 Handler
+app.use((req, res) => {
+  res.status(404).json({ 
+    error: `Not found: ${req.method} ${req.originalUrl}` 
+  });
 });
 
-
+// Error Handler
 app.use((err, req, res, next) => {
   console.error("[api error]", err);
-  res.status(err.status || 500).json({ error: err.message || "Internal server error" });
+  res.status(err.status || 500).json({ 
+    error: err.message || "Internal server error" 
+  });
 });
 
 const server = http.createServer(app);
+
 const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN || "*",
+    origin: allowedOrigins,
+    credentials: true,
     methods: ["GET", "POST"]
   }
 });
@@ -71,6 +74,7 @@ const io = new Server(server, {
 (async () => {
   try {
     await initDb();
+    console.log("[db] Database initialized successfully");
   } catch (err) {
     console.error("[db] init failed (continuing without persistence):", err.message);
   }
@@ -78,7 +82,6 @@ const io = new Server(server, {
   initSocket(io);
   initMqtt();
 
-  // Broadcast MQTT status every 10 seconds
   setInterval(() => {
     broadcastMqttStatus();
   }, 10000);
