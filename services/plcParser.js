@@ -1,10 +1,10 @@
+// backend/services/plcService.js
 'use strict';
-
 
 const fs = require('fs');
 const path = require('path');
 
-const { parameterFromTopic } = require('../mqtt/topicManager');
+const { parameterFromTopic, KNOWN_PARAMETERS } = require('../mqtt/topicManager');
 const { broadcast } = require('./socketService');
 const { evaluate } = require('./alarmService');
 const { saveMeasurement } = require('../database/postgres');
@@ -30,7 +30,7 @@ function bufferFromRaw(raw) {
   if (typeof raw === 'string') {
     const trimmed = raw.trim();
     if (trimmed === '') return null;
-    return Buffer.from(trimmed, 'utf8'); // keep as literal text buffer here; hex-peeling happens separately
+    return Buffer.from(trimmed, 'utf8');
   }
   try { return Buffer.from(String(raw)); } catch (_) { return null; }
 }
@@ -47,22 +47,15 @@ function hexdump(buf, maxBytes = 256) {
   return lines.join('\n');
 }
 
-/**
- * Peel off successive layers of hex-encoding. A "layer" is peeled when the
- * buffer's ASCII representation (minus any trailing non-hex junk like a
- * null terminator) is itself a valid, even-length hex string.
- * Stops as soon as a layer no longer looks like hex, or after maxLayers.
- * Returns { buffer, layersPeeled }.
- */
 function peelHexLayers(initialBuf, maxLayers = 4) {
   let buf = initialBuf;
   let layersPeeled = 0;
   for (let layer = 0; layer < maxLayers; layer++) {
     if (!Buffer.isBuffer(buf) || buf.length === 0) break;
     const asAscii = buf.toString('ascii');
-    const cleaned = asAscii.replace(/[^0-9A-Fa-f]+$/, ''); // strip trailing null/junk
-    if (cleaned.length < 8) break; // too short to bother
-    if (!isHexString(cleaned)) break; // not hex (odd length or bad chars) -> stop, this is real binary
+    const cleaned = asAscii.replace(/[^0-9A-Fa-f]+$/, '');
+    if (cleaned.length < 8) break;
+    if (!isHexString(cleaned)) break;
     try {
       const decoded = Buffer.from(cleaned, 'hex');
       buf = decoded;
@@ -82,24 +75,6 @@ function isPrintableAscii(buf) {
   return /^[\x20-\x7E]+$/.test(s);
 }
 
-/**
- * Reads a float32 using "BADC" byte order (byte-swapped word pairs):
- * given raw bytes [b0,b1,b2,b3], reinterprets as [b1,b0,b3,b2] little-endian.
- *
- * This was determined empirically against a real captured payload: plain
- * LE/BE reads produced denormalized near-zero garbage for most fields
- * (e.g. FEEDFlow read as -2.3e-33), while BADC produced physically
- * consistent values across the whole record set - confirmed by:
- *   FEEDFlow (68.91) ~= Permeateflow (48.28) + ConcentrateFlow (20.0)
- *   MediaFilterInPress (2.46) - MediaFilterOutPress (2.21) = MediaFilterDeltaP (0.25) exactly
- * This is a common Modbus/PLC gateway float encoding (word-swapped IEEE754),
- * distinct from both pure little-endian and pure big-endian.
- *
- * If a future firmware/gateway change causes values to look wrong again
- * (e.g. all near-zero, or absurdly large), re-run the byte-order probe:
- * try all 4 combinations against a payload where you know the true reading
- * from the HMI, and pick whichever gives a plausible number.
- */
 function readFloatBADC(buf, offset) {
   if (offset < 0 || offset + 4 > buf.length) return NaN;
   const b0 = buf[offset], b1 = buf[offset + 1], b2 = buf[offset + 2], b3 = buf[offset + 3];
@@ -108,7 +83,7 @@ function readFloatBADC(buf, offset) {
 
 /**
  * Parse the level-2 binary buffer into named tag readings.
- * See file header for the record layout this expects.
+ * Now handles both float32 (4 bytes) and bit/byte (1 byte) values.
  */
 function parseNamedRecords(buf) {
   if (!Buffer.isBuffer(buf) || buf.length < 20) return [];
@@ -132,12 +107,22 @@ function parseNamedRecords(buf) {
     const typeByte = buf[i + 11];
     const lenByte = buf[i + 12];
 
-    if (lenByte !== 4) continue; // only float32 records handled; extend here if other types appear
-    if (i + 17 > buf.length) continue;
-
     let value;
+    let dataType = 'float';
+    
     try {
-      value = readFloatBADC(buf, i + 13);
+      if (lenByte === 4) {
+        // Float32 (4 bytes)
+        value = readFloatBADC(buf, i + 13);
+        dataType = 'float';
+      } else if (lenByte === 1) {
+        // Bit/Byte (1 byte)
+        value = buf[i + 13] || 0;
+        dataType = 'bit';
+      } else {
+        // Unknown type, skip
+        continue;
+      }
     } catch (_) {
       continue;
     }
@@ -145,9 +130,6 @@ function parseNamedRecords(buf) {
     const nameLenDeclared = buf[i + 17];
     const nameStartBase = i + 18;
 
-    // Self-correct +/- a couple bytes in case the device's declared length is
-    // occasionally off (observed once in captured payloads) - pick the first
-    // delta that yields a printable name AND a printable (or empty) unit.
     let parsed = null;
     for (const delta of [0, -1, 1, -2, 2]) {
       const nameLen = nameLenDeclared + delta;
@@ -178,12 +160,13 @@ function parseNamedRecords(buf) {
     records.push({
       parameter: parsed.name,
       unit: parsed.unit,
-      value,
+      value: value,
       recordIndex,
       typeByte,
+      dataType,
       timestamp: new Date().toISOString(),
       simulated: false,
-      debug: { offset: i, recordIndex }
+      debug: { offset: i, recordIndex, dataType }
     });
   }
 
@@ -257,7 +240,7 @@ function parseAboxPayload(buf) {
   return measurements;
 }
 
-/* ------------------ legacy calibration support (kept for compatibility) ------------------ */
+/* ------------------ legacy calibration support ------------------ */
 
 function readByMethod(buf, offset, method) {
   try {
@@ -343,13 +326,16 @@ function recordToDB(record) {
   return saveMeasurement(payload);
 }
 
-/* ------------------ processing pipeline ------------------ */
+/* ------------------ PROCESSING PIPELINE ------------------ */
 
 function processMeasurement(topic, measurement, idx, rawBuf) {
   let parameter = measurement.parameter || parameterFromTopic(topic) || null;
-  if (!parameter && measurement.dcode && calibration && calibration[`D${measurement.dcode}`] && calibration[`D${measurement.dcode}`].parameter) {
-    parameter = calibration[`D${measurement.dcode}`].parameter;
+  
+  // ✅ MAP AntiscalantDoser to the correct parameter name
+  if (parameter === 'AntiscalantDoser' || parameter === 'DosingActive') {
+    parameter = 'AntiscalantDosingActive';
   }
+  
   if (!isValidParameterName(parameter)) {
     parameter = parameterFromTopic(topic) || `unknown_${idx || 'x'}`;
   }
@@ -361,6 +347,7 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     value: (measurement.value === undefined) ? null : measurement.value,
     timestamp: measurement.timestamp || new Date().toISOString(),
     simulated: !!measurement.simulated,
+    dataType: measurement.dataType || 'float',
     debug: measurement.debug || {}
   };
 
@@ -396,14 +383,18 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
   }
 }
 
+/* ------------------ MAIN HANDLER ------------------ */
+
 function handleIncoming(topic, raw) {
   const rawBuf = bufferFromRaw(raw);
 
   if (LOG_RAW) {
     if (rawBuf) {
       console.log(`[plc][RAW] topic=${topic} bytes=${rawBuf.length}`);
-      console.log(`[plc][RAW] hex=${rawBuf.toString('hex')}`);
-      console.log(`[plc][RAW] ascii=${rawBuf.toString('ascii').replace(/[^\x20-\x7E]/g, '.')}`);
+      if (DEBUG_PARSE) {
+        console.log(`[plc][RAW] hex=${rawBuf.toString('hex')}`);
+        console.log(`[plc][RAW] ascii=${rawBuf.toString('ascii').replace(/[^\x20-\x7E]/g, '.')}`);
+      }
     } else {
       console.log(`[plc][RAW] topic=${topic} <empty/undecodable payload> typeof=${typeof raw}`);
     }
@@ -411,8 +402,6 @@ function handleIncoming(topic, raw) {
 
   if (!rawBuf) return;
 
-  // Peel however many hex layers this payload actually has (usually 2 for
-  // this device, but this adapts if firmware changes to 1 layer or 0).
   const { buffer: decodedBuf, layersPeeled } = peelHexLayers(rawBuf);
   if (DEBUG_PARSE || LOG_RAW) {
     console.log(`[plc] peeled ${layersPeeled} hex layer(s), decoded length=${decodedBuf.length}`);
@@ -451,6 +440,24 @@ function handleIncoming(topic, raw) {
     return;
   }
 
+  // ✅ CONVERT BIT VALUES TO ON/OFF FOR ANTISCALANT DOSER
+  parsedList.forEach((record) => {
+    // Check if this is a bit/byte value for Antiscalant Doser
+    const isAntiscalant = record.parameter === 'AntiscalantDoser' || 
+                          record.parameter === 'AntiscalantDosingActive' || 
+                          record.parameter === 'DosingActive' ||
+                          record.parameter === 'Doser' ||
+                          record.parameter === 'Dosing';
+    
+    if (isAntiscalant || record.dataType === 'bit' || (record.value === 0 || record.value === 1)) {
+      // Convert 0/1 to OFF/ON for better readability
+      record.value = record.value === 1 ? 'ON' : 'OFF';
+      record.unit = '';
+      record.dataType = 'bit';
+      console.log(`[plc] 🔄 Converted AntiscalantDoser to: ${record.value}`);
+    }
+  });
+
   parsedList.forEach((m, idx) => {
     try {
       processMeasurement(topic, m, idx, rawBuf);
@@ -460,23 +467,25 @@ function handleIncoming(topic, raw) {
   });
 }
 
-/* ------------------ snapshot getters ------------------ */
+/* ------------------ SNAPSHOT GETTERS ------------------ */
 
 function getLatestSnapshot() {
   const out = {};
   for (const [k, v] of Object.entries(latest)) out[k] = v.value;
   return out;
 }
+
 function getLatestFull() { return latest; }
+
 function getCalibration() { return calibration; }
 
-/* ------------------ exports ------------------ */
+/* ------------------ EXPORTS ------------------ */
 
 module.exports = {
   handleIncoming,
   getLatestSnapshot,
   getLatestFull,
   getCalibration,
-  // exposed for testing/debugging in a REPL or test script
+  // exposed for testing/debugging
   _internal: { peelHexLayers, parseNamedRecords, hexdump }
 };

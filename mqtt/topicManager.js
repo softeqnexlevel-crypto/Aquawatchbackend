@@ -1,3 +1,4 @@
+// backend/mqtt/topicManager.js
 /**
  * Topics from an A-Box style gateway follow <ROOT>/<OrderName>,
  * e.g. R05/FEEDFlow — the last segment IS the parameter name.
@@ -13,9 +14,26 @@
  * "a parameter called datalist" / "a parameter called getboxdata".
  */
 const KNOWN_PARAMETERS = [
-  "FEEDFlow", "Permeateflow", "ConcentrateFlow", "ROPressure",
-  "InterstagePress", "ConcentratePress", "Stage1Delta", "Stage2Delta",
-  "MediaFilterInPress", "MediaFilterOutPress", "SystemRecovery", "PureWaterEC",
+  "FEEDFlow", 
+  "Permeateflow", 
+  "ConcentrateFlow", 
+  "ROPressure",
+  "InterstagePress", 
+  "ConcentratePress", 
+  "Stage1Delta", 
+  "Stage2Delta",
+  "MediaFilterInPress", 
+  "MediaFilterOutPress", 
+  "SystemRecovery", 
+  "PureWaterEC",
+  "FeedTankLevel",
+  "SystemOperation",
+  "SystemMode",
+  // ✅ ADD ANTISCALANT DOSER
+  "AntiscalantDoser",
+  "AntiscalantDosingActive",
+  "DosingActive",
+  "Doser",
 ];
 
 const SPECIAL_TOPIC_SUFFIXES = {
@@ -39,4 +57,9 @@ function classifyTopic(topic) {
   return "standard";
 }
 
-module.exports = { KNOWN_PARAMETERS, parameterFromTopic, classifyTopic, SPECIAL_TOPIC_SUFFIXES };
+module.exports = { 
+  KNOWN_PARAMETERS, 
+  parameterFromTopic, 
+  classifyTopic, 
+  SPECIAL_TOPIC_SUFFIXES 
+};
