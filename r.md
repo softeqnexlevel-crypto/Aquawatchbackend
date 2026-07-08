@@ -1127,3 +1127,6 @@ function getLatestSnapshot() {
 function getLatestFull() { return { ...latest }; }
 
 module.exports = { handleIncoming, getLatestSnapshot, getLatestFull };
+
+
+PASETO_SYMMETRIC_KEY=niYnaovaURG76RdPgqjhnrj6HLt7xPsx+MZZg8GSUXw=
