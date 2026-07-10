@@ -1,4 +1,5 @@
-// backend/services/plcService.js
+// backend/services/plcService.js - UPDATED WITH FIX
+
 'use strict';
 
 const fs = require('fs');
@@ -340,7 +341,8 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     parameter = parameterFromTopic(topic) || `unknown_${idx || 'x'}`;
   }
 
-  const record = {
+  // ✅ FIX: Keep numeric values, don't convert to strings
+  let record = {
     topic,
     parameter,
     unit: measurement.unit || null,
@@ -350,6 +352,19 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     dataType: measurement.dataType || 'float',
     debug: measurement.debug || {}
   };
+
+  // ✅ FIX: Keep value as number, add status as separate field if needed
+  const isAntiscalant = parameter === 'AntiscalantDosingActive';
+  if (isAntiscalant) {
+    // Keep numeric value for calculations
+    const numValue = Number(record.value);
+    record.value = isNaN(numValue) ? 0 : numValue; // 0 or 1
+    record.unit = '';
+    record.dataType = 'bit';
+    record.status = record.value === 1 ? 'ON' : 'OFF'; // Add status for display
+    
+    console.log(`[plc] ${parameter}: value=${record.value}, status=${record.status}`);
+  }
 
   latest[parameter] = record;
   dataCount++;
@@ -439,24 +454,6 @@ function handleIncoming(topic, raw) {
     archiveRawPayload(topic, rawBuf);
     return;
   }
-
-  // ✅ CONVERT BIT VALUES TO ON/OFF FOR ANTISCALANT DOSER
-  parsedList.forEach((record) => {
-    // Check if this is a bit/byte value for Antiscalant Doser
-    const isAntiscalant = record.parameter === 'AntiscalantDoser' || 
-                          record.parameter === 'AntiscalantDosingActive' || 
-                          record.parameter === 'DosingActive' ||
-                          record.parameter === 'Doser' ||
-                          record.parameter === 'Dosing';
-    
-    if (isAntiscalant || record.dataType === 'bit' || (record.value === 0 || record.value === 1)) {
-      // Convert 0/1 to OFF/ON for better readability
-      record.value = record.value === 1 ? 'ON' : 'OFF';
-      record.unit = '';
-      record.dataType = 'bit';
-      console.log(`[plc] 🔄 Converted AntiscalantDoser to: ${record.value}`);
-    }
-  });
 
   parsedList.forEach((m, idx) => {
     try {

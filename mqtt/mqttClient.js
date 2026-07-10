@@ -9,9 +9,12 @@ function initMqtt() {
 
   console.log(`[mqtt] connecting to ${url}, topic root "${root}"...`);
 
+  
+
   try {
     client = mqtt.connect(url, {
-      clientId: process.env.MQTT_CLIENT_ID || `water-mgmt-${Math.random().toString(16).slice(2)}`,
+      clientId: `RO5-${Date.now()}` ,
+      //  `water-mgmt-${Math.random().toString(16).slice(2)}`
       username: process.env.MQTT_USERNAME || undefined,
       password: process.env.MQTT_PASSWORD || undefined,
       clean: true,

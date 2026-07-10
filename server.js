@@ -68,7 +68,12 @@ const io = new Server(server, {
     origin: allowedOrigins,
     credentials: true,
     methods: ["GET", "POST"]
-  }
+  },
+  // ✅ ADD THIS - CRITICAL FIX
+  transports: ['websocket', 'polling'],
+  allowEIO3: true,
+  pingTimeout: 60000,
+  pingInterval: 25000,
 });
 
 (async () => {
@@ -80,6 +85,10 @@ const io = new Server(server, {
   }
 
   initSocket(io);
+  setTimeout(() => {
+  console.log('🔍 Socket clients:', io.sockets.sockets.size);
+  console.log('🔍 Socket namespaces:', io.nsps);
+}, 2000);
   initMqtt();
 
   setInterval(() => {
