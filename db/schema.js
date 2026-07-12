@@ -176,6 +176,26 @@ const alertRules = pgTable('alert_rules', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 });
 
+ 
+const systemSettings = pgTable('system_settings', {
+  
+  id: integer('id').primaryKey(),
+  plantName: varchar('plant_name', { length: 255 }),
+  operatorId: varchar('operator_id', { length: 100 }),
+  productionTarget: doublePrecision('production_target'),
+  recoveryTarget: doublePrecision('recovery_target'),
+  filterDpWarn: doublePrecision('filter_dp_warn'),
+  filterDpCrit: doublePrecision('filter_dp_crit'),
+  lowRecoveryWarn: doublePrecision('low_recovery_warn'),
+  lowChemAlert: doublePrecision('low_chem_alert'),
+  minDosing: doublePrecision('min_dosing'),
+  maxDosing: doublePrecision('max_dosing'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  updatedBy: uuid('updated_by'),
+});
+ 
+
+
 module.exports = {
   users,
   refreshTokens,
@@ -184,5 +204,6 @@ module.exports = {
   devices,
   tags,
   auditLogs,
+  systemSettings,
   alertRules,
 };

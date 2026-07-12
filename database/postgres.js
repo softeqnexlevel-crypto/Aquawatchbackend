@@ -576,6 +576,62 @@ async function getActiveAlertRules(organizationId = null) {
     return query;
 }
 
+const DEFAULT_SETTINGS = {
+  plantName: 'Nairobi Water Treatment Plant',
+  operatorId: 'WTP-2024-NBI-001',
+  productionTarget: 4200,
+  recoveryTarget: 78,
+  filterDpWarn: 0.50,
+  filterDpCrit: 0.65,
+  lowRecoveryWarn: 76,
+  lowChemAlert: 20,
+  minDosing: 2.0,
+  maxDosing: 3.0,
+};
+ 
+
+
+async function getSettings() {
+    const db = getDb();
+    const result = await db.select()
+        .from(schema.systemSettings)
+        .where(sql`${schema.systemSettings.id} = 1`)
+        .limit(1);
+ 
+    // First run — no row yet. Return sane defaults without writing anything,
+    // so a plain GET never has side effects.
+    return result[0] || { id: 1, ...DEFAULT_SETTINGS, updatedAt: null, updatedBy: null };
+}
+ 
+async function saveSettings(data, userId) {
+    const db = getDb();
+    const values = {
+        id: 1,
+        plantName: data.plantName,
+        operatorId: data.operatorId,
+        productionTarget: Number(data.productionTarget),
+        recoveryTarget: Number(data.recoveryTarget),
+        filterDpWarn: Number(data.filterDpWarn),
+        filterDpCrit: Number(data.filterDpCrit),
+        lowRecoveryWarn: Number(data.lowRecoveryWarn),
+        lowChemAlert: Number(data.lowChemAlert),
+        minDosing: Number(data.minDosing),
+        maxDosing: Number(data.maxDosing),
+        updatedAt: new Date(),
+        updatedBy: userId || null,
+    };
+ 
+    const result = await db.insert(schema.systemSettings)
+        .values(values)
+        .onConflictDoUpdate({
+            target: schema.systemSettings.id,
+            set: values,
+        })
+        .returning();
+ 
+    return result[0];
+}
+
 // ============================================================
 // EXPORTS
 // ============================================================
@@ -633,6 +689,10 @@ module.exports = {
     // Audit
     logAction,
     getAuditLogs,
+
+    // setting
+    getSettings,
+    saveSettings,
     
     // Schema
     schema,

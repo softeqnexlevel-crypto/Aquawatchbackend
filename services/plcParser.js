@@ -18,6 +18,50 @@ const MIN_VALID_ABS_VALUE = Number(process.env.MIN_VALID_ABS_VALUE) || 1e-6;
 const latest = {};
 let dataCount = 0;
 
+/* ------------------ DB write downsampling ------------------ */
+// The live dashboard reads from `latest` / socket broadcasts (unthrottled,
+// still updated on every single message). This section only controls how
+// often a row actually gets persisted to Postgres, to prevent the
+// measurements table from growing unbounded (see DB_SAMPLE_INTERVAL_MS).
+
+const DB_SAMPLE_INTERVAL_MS = Number(process.env.DB_SAMPLE_INTERVAL_MS) || 30000; // 30s default
+
+const lastDbWriteTime = {};
+const lastDbWrittenValue = {}; // tracks last value actually persisted, per parameter
+
+// For continuous numeric readings, only write once per DB_SAMPLE_INTERVAL_MS —
+// they change gradually, so periodic sampling loses nothing meaningful.
+//
+// For bit/status parameters (dosing ON/OFF, system operation/mode, etc.),
+// ALWAYS write immediately when the value actually changes, regardless of
+// timing — a fixed time window could otherwise miss a quick ON→OFF→ON
+// transition entirely, or leave stale state sitting in history for up to
+// DB_SAMPLE_INTERVAL_MS. Time-based throttling still applies to bit
+// parameters too, but only to suppress redundant writes of an UNCHANGED
+// value, never to skip a genuine transition.
+function shouldWriteToDb(parameter, value, dataType) {
+  const now = Date.now();
+  const last = lastDbWriteTime[parameter] || 0;
+  const valueChanged = lastDbWrittenValue[parameter] !== value;
+
+  if (dataType === 'bit') {
+    if (valueChanged) {
+      lastDbWriteTime[parameter] = now;
+      lastDbWrittenValue[parameter] = value;
+      return true; // always capture a real transition, no matter how recent the last write was
+    }
+    // Unchanged bit value — still fall through to normal time-based
+    // throttling below, so an unchanging status doesn't spam the DB either.
+  }
+
+  if (now - last >= DB_SAMPLE_INTERVAL_MS) {
+    lastDbWriteTime[parameter] = now;
+    lastDbWrittenValue[parameter] = value;
+    return true;
+  }
+  return false;
+}
+
 /* ------------------ buffer / hex helpers ------------------ */
 
 function isHexString(s) {
@@ -365,11 +409,18 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     return;
   }
 
-  recordToDB(record).catch((err) => {
-    if (dataCount % 100 === 0) {
-      console.error('[db] save failed (continuing):', err && err.message ? err.message : err);
-    }
-  });
+  // ✅ Downsample DB writes — the live dashboard reads from `latest` /
+  // socket broadcasts below (unthrottled), so this only affects how much
+  // history piles up in Postgres, not real-time responsiveness. Bit/status
+  // parameters bypass the timer on a genuine value change (see
+  // shouldWriteToDb above), so ON/OFF transitions are never missed.
+  if (shouldWriteToDb(parameter, record.value, record.dataType)) {
+    recordToDB(record).catch((err) => {
+      if (dataCount % 100 === 0) {
+        console.error('[db] save failed (continuing):', err && err.message ? err.message : err);
+      }
+    });
+  }
 
   try {
     // Alarm evaluation only makes sense for numeric readings
