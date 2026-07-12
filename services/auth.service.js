@@ -1,203 +1,223 @@
+// backend/services/auth.service.js
+'use strict';
+
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const pasetoService = require('./paseto.service');
+const db = require('../database/postgres');
 
-// In-memory database
-const users = [];
-const refreshTokens = [];
+/* ============================================================
+   DEFAULT SEED USERS
+   Only created once, the first time the users table is empty.
+   Unlike the old in-memory version, this does NOT run on every
+   startup — otherwise it would try to re-insert users that
+   already exist and throw on the unique email constraint.
+   ============================================================ */
 
-// Add default users with correct passwords
+const DEFAULT_USERS = [
+    { email: 'admin@aquaops.co.ke', password: 'admin123', firstName: 'John', lastName: 'Mwangi', role: 'admin' },
+    { email: 'operator@aquaops.co.ke', password: 'operator123', firstName: 'Grace', lastName: 'Wanjiku', role: 'operator' },
+    { email: 'client@aquaops.co.ke', password: 'client123', firstName: 'Peter', lastName: 'Kamau', role: 'client' },
+];
+
 async function initUsers() {
-    const salt = await bcrypt.genSalt(10);
-    
-    users.push({
-        id: '1',
-        email: 'admin@aquaops.co.ke',
-        password_hash: await bcrypt.hash('admin123', salt),
-        first_name: 'John',
-        last_name: 'Mwangi',
-        role: 'admin',
-        is_active: true,
-        created_at: new Date().toISOString()
-    });
-    
-    users.push({
-        id: '2',
-        email: 'operator@aquaops.co.ke',
-        password_hash: await bcrypt.hash('operator123', salt),
-        first_name: 'Grace',
-        last_name: 'Wanjiku',
-        role: 'operator',
-        is_active: true,
-        created_at: new Date().toISOString()
-    });
-    
-    users.push({
-        id: '3',
-        email: 'client@aquaops.co.ke',
-        password_hash: await bcrypt.hash('client123', salt),
-        first_name: 'Peter',
-        last_name: 'Kamau',
-        role: 'client',
-        is_active: true,
-        created_at: new Date().toISOString()
-    });
-    
-    console.log('Default users created');
+    try {
+        const existing = await db.getAllUsers();
+        if (existing && existing.length > 0) {
+            console.log(`[auth] ${existing.length} user(s) already in database — skipping default seed`);
+            return;
+        }
+
+        for (const u of DEFAULT_USERS) {
+            const passwordHash = await bcrypt.hash(u.password, 10);
+            await db.createUser({
+                email: u.email,
+                passwordHash,
+                firstName: u.firstName,
+                lastName: u.lastName,
+                role: u.role,
+            });
+        }
+        console.log('[auth] Default users seeded into database');
+    } catch (err) {
+        // Don't crash the server if seeding fails (e.g. DB not ready yet) —
+        // log it clearly so it's not silently swallowed like past bugs were.
+        console.error('[auth] Failed to seed default users:', err.message);
+    }
 }
 
-initUsers();
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
+// Shape a DB user row into the safe, camelCase object sent to clients —
+// never leak passwordHash outward.
+function toPublicUser(user) {
+    if (!user) return null;
+    return {
+        id: user.id,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        role: user.role,
+        isActive: user.isActive,
+        createdAt: user.createdAt,
+    };
+}
+
+function hashToken(token) {
+    return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/* ============================================================
+   AUTH SERVICE
+   ============================================================ */
 
 class AuthService {
-    async login(email, password) {
-        const user = users.find(u => u.email === email.toLowerCase());
+    async login(email, password, deviceInfo = {}) {
+        const user = await db.findUserByEmail(email);
         if (!user) throw new Error('Invalid credentials');
-        if (!user.is_active) throw new Error('Account disabled');
-        
-        const valid = await bcrypt.compare(password, user.password_hash);
+        if (!user.isActive) throw new Error('Account disabled');
+
+        const valid = await bcrypt.compare(password, user.passwordHash);
         if (!valid) throw new Error('Invalid credentials');
-        
+
         const accessToken = await pasetoService.generateAccessToken(user);
         const refreshToken = await pasetoService.generateRefreshToken(user);
-        
-        // Store refresh token hash
-        refreshTokens.push({
-            user_id: user.id,
-            token_hash: crypto.createHash('sha256').update(refreshToken).digest('hex'),
-            expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+
+        await db.saveRefreshToken({
+            userId: user.id,
+            tokenHash: hashToken(refreshToken),
+            expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+            ipAddress: deviceInfo.ip || null,
+            userAgent: deviceInfo.userAgent || null,
+            deviceId: deviceInfo.deviceId || null,
+            deviceName: deviceInfo.deviceName || null,
+            deviceType: deviceInfo.deviceType || null,
+            location: deviceInfo.location || null,
         });
-        
+
         return {
-            user: {
-                id: user.id,
-                email: user.email,
-                firstName: user.first_name,
-                lastName: user.last_name,
-                role: user.role
-            },
+            user: toPublicUser(user),
             accessToken,
             refreshToken,
-            expiresIn: 900
+            expiresIn: 900,
         };
     }
-    
+
     async refreshToken(token) {
         const payload = await pasetoService.verifyRefreshToken(token);
         if (!payload) throw new Error('Invalid refresh token');
-        
-        const hash = crypto.createHash('sha256').update(token).digest('hex');
-        const stored = refreshTokens.find(t => t.token_hash === hash && new Date(t.expires_at) > new Date());
+
+        const hash = hashToken(token);
+        const stored = await db.findRefreshTokenByHash(hash);
         if (!stored) throw new Error('Invalid refresh token');
-        
-        const user = users.find(u => u.id === payload.sub);
-        if (!user || !user.is_active) throw new Error('User not found');
-        
-        // Remove old token
-        const index = refreshTokens.indexOf(stored);
-        refreshTokens.splice(index, 1);
-        
-        // Generate new tokens
+
+        const user = await db.findUserById(payload.sub);
+        if (!user || !user.isActive) throw new Error('User not found');
+
+        // Rotate: revoke the old refresh token, issue a new pair
+        await db.revokeRefreshToken(hash);
+
         const accessToken = await pasetoService.generateAccessToken(user);
         const newRefreshToken = await pasetoService.generateRefreshToken(user);
-        
-        refreshTokens.push({
-            user_id: user.id,
-            token_hash: crypto.createHash('sha256').update(newRefreshToken).digest('hex'),
-            expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+
+        await db.saveRefreshToken({
+            userId: user.id,
+            tokenHash: hashToken(newRefreshToken),
+            expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
         });
-        
+
         return {
             accessToken,
             refreshToken: newRefreshToken,
-            expiresIn: 900
+            expiresIn: 900,
         };
     }
-    
+
     async getUserById(id) {
-        const user = users.find(u => u.id === id);
-        if (!user) return null;
-        return {
-            id: user.id,
-            email: user.email,
-            firstName: user.first_name,
-            lastName: user.last_name,
-            role: user.role,
-            is_active: user.is_active
-        };
+        const user = await db.findUserById(id);
+        return toPublicUser(user);
     }
-    
+
     async getAllUsers() {
-        return users.map(u => ({
-            id: u.id,
-            email: u.email,
-            first_name: u.first_name,
-            last_name: u.last_name,
-            role: u.role,
-            is_active: u.is_active,
-            created_at: u.created_at
-        }));
+        const users = await db.getAllUsers();
+        return users.map(toPublicUser);
     }
-    
+
     async register(userData) {
-        const exists = users.find(u => u.email === userData.email.toLowerCase());
+        const exists = await db.findUserByEmail(userData.email);
         if (exists) throw new Error('User already exists');
-        
-        const salt = await bcrypt.genSalt(10);
-        const user = {
-            id: crypto.randomUUID(),
-            email: userData.email.toLowerCase(),
-            password_hash: await bcrypt.hash(userData.password, salt),
-            first_name: userData.firstName,
-            last_name: userData.lastName || '',
+
+        const passwordHash = await bcrypt.hash(userData.password, 10);
+        const user = await db.createUser({
+            email: userData.email,
+            passwordHash,
+            firstName: userData.firstName,
+            lastName: userData.lastName || '',
             role: userData.role || 'operator',
-            is_active: true,
-            created_at: new Date().toISOString()
-        };
-        
-        users.push(user);
-        return {
-            id: user.id,
-            email: user.email,
-            firstName: user.first_name,
-            lastName: user.last_name,
-            role: user.role
-        };
+        });
+
+        return toPublicUser(user);
     }
-    
+
     async updateUser(id, updates) {
-        const user = users.find(u => u.id === id);
+        const patch = {};
+        if (typeof updates.firstName !== 'undefined') patch.firstName = updates.firstName;
+        if (typeof updates.lastName !== 'undefined') patch.lastName = updates.lastName;
+        if (typeof updates.role !== 'undefined') patch.role = updates.role;
+        if (typeof updates.isActive !== 'undefined') patch.isActive = updates.isActive;
+
+        const user = await db.updateUser(id, patch);
         if (!user) throw new Error('User not found');
-        
-        if (updates.firstName) user.first_name = updates.firstName;
-        if (updates.lastName) user.last_name = updates.lastName;
-        if (updates.role) user.role = updates.role;
-        if (typeof updates.isActive !== 'undefined') user.is_active = updates.isActive;
-        
-        return {
-            id: user.id,
-            email: user.email,
-            firstName: user.first_name,
-            lastName: user.last_name,
-            role: user.role,
-            is_active: user.is_active
-        };
+        return toPublicUser(user);
     }
-    
+
     async deleteUser(id) {
-        const index = users.findIndex(u => u.id === id);
-        if (index === -1) throw new Error('User not found');
-        users.splice(index, 1);
+        // Soft delete by default — matches postgres.js's deleteUser(id, hardDelete=false)
+        const result = await db.deleteUser(id, false);
+        if (!result) throw new Error('User not found');
         return true;
     }
-    
+
+    async changePassword(userId, currentPassword, newPassword) {
+        const user = await db.findUserById(userId);
+        if (!user) throw new Error('User not found');
+
+        const valid = await bcrypt.compare(currentPassword, user.passwordHash);
+        if (!valid) throw new Error('Current password is incorrect');
+
+        const passwordHash = await bcrypt.hash(newPassword, 10);
+        await db.updateUser(userId, { passwordHash });
+
+        // Invalidate existing sessions so the old password can't keep being used elsewhere
+        await db.revokeAllUserRefreshTokens(userId);
+
+        return true;
+    }
+
     async logout(userId, refreshToken) {
         if (refreshToken) {
-            const hash = crypto.createHash('sha256').update(refreshToken).digest('hex');
-            const index = refreshTokens.findIndex(t => t.token_hash === hash);
-            if (index !== -1) refreshTokens.splice(index, 1);
+            await db.revokeRefreshToken(hashToken(refreshToken));
+        } else {
+            await db.revokeAllUserRefreshTokens(userId);
         }
         return true;
     }
+
+    async getAuditLogs(userId, limit = 50) {
+        // organizationId scoping intentionally left null here — wire in once
+        // multi-tenant organizationId is threaded through the auth middleware.
+        return db.getAuditLogs(null, limit);
+    }
 }
 
-module.exports = new AuthService();
+const authService = new AuthService();
+
+// Seed default users once, on module load (mirrors the old behavior of
+// running at startup), but now idempotently against the real database.
+authService.initUsers = initUsers;
+
+module.exports = authService;

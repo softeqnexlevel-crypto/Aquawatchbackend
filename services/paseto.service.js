@@ -23,8 +23,8 @@ class PasetoService {
             sub: user.id,
             email: user.email,
             role: user.role,
-            first_name: user.first_name || '',
-            last_name: user.last_name || '',
+            firstName: user.firstName || '',
+            lastName: user.lastName || '',
             type: 'access',
             iat: now.toISOString(),
             exp: new Date(Date.now() + 900000).toISOString() // STRING format

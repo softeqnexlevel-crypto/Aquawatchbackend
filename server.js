@@ -12,6 +12,7 @@ const { initMqtt, getStatus } = require("./mqtt/mqttClient");
 const { initSocket, broadcastMqttStatus } = require("./services/socketService");
 const { initDb } = require("./database/postgres");
 const apiRoutes = require("./routes/api");
+const authService = require("./services/auth.service"); // ✅ ADDED
 
 const app = express();
 
@@ -69,7 +70,6 @@ const io = new Server(server, {
     credentials: true,
     methods: ["GET", "POST"]
   },
-  // ✅ ADD THIS - CRITICAL FIX
   transports: ['websocket', 'polling'],
   allowEIO3: true,
   pingTimeout: 60000,
@@ -80,15 +80,22 @@ const io = new Server(server, {
   try {
     await initDb();
     console.log("[db] Database initialized successfully");
+
+    // ✅ ADDED — must run after initDb() resolves, since initUsers() queries
+    // the database. Calling this at module-require time (like the old
+    // auth.service.js used to) would race against initDb() and silently
+    // fail with "Database not initialized", leaving the users table empty
+    // forever — which is exactly what was happening.
+    await authService.initUsers();
   } catch (err) {
     console.error("[db] init failed (continuing without persistence):", err.message);
   }
 
   initSocket(io);
   setTimeout(() => {
-  console.log('🔍 Socket clients:', io.sockets.sockets.size);
-  console.log('🔍 Socket namespaces:', io.nsps);
-}, 2000);
+    console.log('🔍 Socket clients:', io.sockets.sockets.size);
+    console.log('🔍 Socket namespaces:', io.nsps);
+  }, 2000);
   initMqtt();
 
   setInterval(() => {

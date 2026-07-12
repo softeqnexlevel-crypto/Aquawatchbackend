@@ -247,19 +247,28 @@ async function revokeAllUserRefreshTokens(userId) {
 // ============================================================
 // REPOSITORY: MEASUREMENTS
 // ============================================================
+//
+// FIXED: schema.measurements (see db/schema.js) defines a NOT NULL
+// "parameter" column — there is no "tagId" or "rawValue" column on this
+// table. The previous version of these functions passed tagId/rawValue
+// instead of parameter, which Drizzle silently dropped (object keys with no
+// matching column are ignored), leaving "parameter" unset on every insert
+// and causing every single measurement save to fail a NOT NULL constraint.
+// All functions below now consistently use "parameter" (a string like
+// "RO5-ROPressure"), matching exactly what plcService.js's recordToDB()
+// actually sends and what the live database schema actually has.
 
 async function saveMeasurement(data) {
     const db = getDb();
     const result = await db.insert(schema.measurements).values({
         id: generateUUID(),
-        tagId: data.tagId,
         time: data.timestamp ? new Date(data.timestamp) : new Date(),
+        parameter: data.parameter,
         value: data.value,
-        rawValue: data.rawValue,
         unit: data.unit || '',
-        quality: data.quality || 100,
         topic: data.topic || '',
         simulated: data.simulated || false,
+        quality: data.quality || 100,
         metadata: data.metadata || {},
     }).returning();
     return result[0];
@@ -269,39 +278,38 @@ async function saveBatchMeasurements(measurementsData) {
     const db = getDb();
     const values = measurementsData.map(data => ({
         id: generateUUID(),
-        tagId: data.tagId,
         time: data.timestamp ? new Date(data.timestamp) : new Date(),
+        parameter: data.parameter,
         value: data.value,
-        rawValue: data.rawValue,
         unit: data.unit || '',
-        quality: data.quality || 100,
         topic: data.topic || '',
         simulated: data.simulated || false,
+        quality: data.quality || 100,
         metadata: data.metadata || {},
     }));
     return db.insert(schema.measurements).values(values).returning();
 }
 
-async function getLatestMeasurement(tagId) {
+async function getLatestMeasurement(parameter) {
     const db = getDb();
     const result = await db.select()
         .from(schema.measurements)
-        .where(sql`${schema.measurements.tagId} = ${tagId}`)
+        .where(sql`${schema.measurements.parameter} = ${parameter}`)
         .orderBy(schema.measurements.time, 'desc')
         .limit(1);
     return result[0] || null;
 }
 
-async function getMeasurementHistory(tagId, hours = 24, limit = 1000) {
+async function getMeasurementHistory(parameter, hours = 24, limit = 1000) {
     const db = getDb();
     return db.select()
         .from(schema.measurements)
-        .where(sql`${schema.measurements.tagId} = ${tagId} AND ${schema.measurements.time} > NOW() - INTERVAL '${hours} hours'`)
+        .where(sql`${schema.measurements.parameter} = ${parameter} AND ${schema.measurements.time} > NOW() - INTERVAL '${hours} hours'`)
         .orderBy(schema.measurements.time, 'asc')
         .limit(limit);
 }
 
-async function getMeasurementAggregates(tagId, bucket = '1 hour', hours = 24) {
+async function getMeasurementAggregates(parameter, bucket = '1 hour', hours = 24) {
     const db = getDb();
     return db.execute(sql`
         SELECT 
@@ -311,13 +319,55 @@ async function getMeasurementAggregates(tagId, bucket = '1 hour', hours = 24) {
             MAX(value) AS max_value,
             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY value) AS median_value,
             COUNT(*) AS sample_count
-        FROM ${schema.measurements}
-        WHERE tag_id = ${tagId}
+        FROM measurements
+        WHERE parameter = ${parameter}
             AND time > NOW() - INTERVAL ${hours + ' hours'}
         GROUP BY bucket
         ORDER BY bucket DESC
     `);
 }
+
+
+async function getProductionVolume(parameter, sinceHoursAgo) {
+    const db = getDb();
+    const result = await db.execute(sql`
+        WITH ordered AS (
+            SELECT
+                time,
+                value,
+                LAG(time) OVER (ORDER BY time) AS prev_time,
+                LAG(value) OVER (ORDER BY time) AS prev_value
+            FROM measurements
+            WHERE parameter = ${parameter}
+                AND time > NOW() - INTERVAL '1 hour' * ${sinceHoursAgo}
+            ORDER BY time
+        )
+        SELECT COALESCE(SUM(
+            CASE
+                WHEN prev_time IS NOT NULL THEN
+                    ((value + prev_value) / 2.0) * (EXTRACT(EPOCH FROM (time - prev_time)) / 3600.0)
+                ELSE 0
+            END
+        ), 0) AS total_volume
+        FROM ordered;
+    `);
+    const row = result.rows ? result.rows[0] : result[0];
+    return Number(row?.total_volume) || 0;
+}
+
+async function getProductionSummary(parameter = 'RO5-Permeateflow') {
+    const [daily, weekly, monthly, yearly] = await Promise.all([
+        getProductionVolume(parameter, 24),
+        getProductionVolume(parameter, 24 * 7),
+        getProductionVolume(parameter, 24 * 30),
+        getProductionVolume(parameter, 24 * 365),
+    ]);
+    return { daily, weekly, monthly, yearly };
+}
+
+// Remember to add these two functions to the module.exports block:
+//   getProductionVolume,
+//   getProductionSummary,
 
 // ============================================================
 // REPOSITORY: ALERTS
@@ -558,6 +608,8 @@ module.exports = {
     getLatestMeasurement,
     getMeasurementHistory,
     getMeasurementAggregates,
+    getProductionVolume,
+    getProductionSummary,
     
     // Alerts
     createAlert,

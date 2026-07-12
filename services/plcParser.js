@@ -1,5 +1,4 @@
-// backend/services/plcService.js - UPDATED WITH FIX
-
+// backend/services/plcService.js
 'use strict';
 
 const fs = require('fs');
@@ -110,7 +109,7 @@ function parseNamedRecords(buf) {
 
     let value;
     let dataType = 'float';
-    
+
     try {
       if (lenByte === 4) {
         // Float32 (4 bytes)
@@ -331,18 +330,17 @@ function recordToDB(record) {
 
 function processMeasurement(topic, measurement, idx, rawBuf) {
   let parameter = measurement.parameter || parameterFromTopic(topic) || null;
-  
+
   // ✅ MAP AntiscalantDoser to the correct parameter name
   if (parameter === 'AntiscalantDoser' || parameter === 'DosingActive') {
     parameter = 'AntiscalantDosingActive';
   }
-  
+
   if (!isValidParameterName(parameter)) {
     parameter = parameterFromTopic(topic) || `unknown_${idx || 'x'}`;
   }
 
-  // ✅ FIX: Keep numeric values, don't convert to strings
-  let record = {
+  const record = {
     topic,
     parameter,
     unit: measurement.unit || null,
@@ -353,19 +351,6 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     debug: measurement.debug || {}
   };
 
-  // ✅ FIX: Keep value as number, add status as separate field if needed
-  const isAntiscalant = parameter === 'AntiscalantDosingActive';
-  if (isAntiscalant) {
-    // Keep numeric value for calculations
-    const numValue = Number(record.value);
-    record.value = isNaN(numValue) ? 0 : numValue; // 0 or 1
-    record.unit = '';
-    record.dataType = 'bit';
-    record.status = record.value === 1 ? 'ON' : 'OFF'; // Add status for display
-    
-    console.log(`[plc] ${parameter}: value=${record.value}, status=${record.status}`);
-  }
-
   latest[parameter] = record;
   dataCount++;
 
@@ -373,7 +358,7 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     console.log(`[plc] 📊 Processed ${dataCount} data points. Latest: ${parameter}=${record.value}${record.unit ? ' ' + record.unit : ''}`);
   }
 
-  if (record.value === null || !Number.isFinite(record.value)) {
+  if (record.value === null || (record.dataType !== 'bit' && !Number.isFinite(record.value))) {
     if (ARCHIVE_RAW_FAILED || DEBUG_PARSE) archiveRawPayload(topic, rawBuf);
     if (DEBUG_PARSE) console.warn('[plc] parsed null/invalid value, skipping DB & alarms:', { parameter, value: record.value });
     try { broadcast('plc-data', record); } catch (e) {}
@@ -387,7 +372,8 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
   });
 
   try {
-    const alarms = evaluate(parameter, record.value);
+    // Alarm evaluation only makes sense for numeric readings
+    const alarms = record.dataType === 'bit' ? [] : evaluate(parameter, record.value);
     broadcast('plc-data', record);
     if (alarms && alarms.length) {
       broadcast('plc-alarm', { parameter, value: record.value, alarms, simulated: record.simulated });
@@ -454,6 +440,26 @@ function handleIncoming(topic, raw) {
     archiveRawPayload(topic, rawBuf);
     return;
   }
+
+  // ✅ CONVERT BIT VALUES TO ON/OFF — ONLY FOR KNOWN BOOLEAN PARAMETERS.
+  // IMPORTANT: never infer "this is a boolean" purely from the value being 0 or 1 —
+  // that misfires on any numeric sensor (flow, pressure, etc.) that legitimately
+  // reads exactly 0 or 1, silently turning a number into the string "ON"/"OFF"
+  // and breaking anything downstream that expects a number (e.g. .toFixed()).
+  parsedList.forEach((record) => {
+    const isAntiscalant = record.parameter === 'AntiscalantDoser' ||
+                          record.parameter === 'AntiscalantDosingActive' ||
+                          record.parameter === 'DosingActive' ||
+                          record.parameter === 'Doser' ||
+                          record.parameter === 'Dosing';
+
+    if (isAntiscalant || record.dataType === 'bit') {
+      record.value = record.value === 1 ? 'ON' : 'OFF';
+      record.unit = '';
+      record.dataType = 'bit';
+      console.log(`[plc] 🔄 Converted ${record.parameter} to: ${record.value}`);
+    }
+  });
 
   parsedList.forEach((m, idx) => {
     try {

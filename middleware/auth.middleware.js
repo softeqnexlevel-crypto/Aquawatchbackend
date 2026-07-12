@@ -25,7 +25,13 @@ class AuthMiddleware {
             }
 
             const user = await authService.getUserById(payload.sub);
-            if (!user || !user.is_active) {
+            // ✅ FIX: authService.getUserById() returns a user shaped by
+            // toPublicUser(), which sets camelCase "isActive" — not the old
+            // in-memory snake_case "is_active". Checking is_active here meant
+            // this was always undefined (falsy), so EVERY authenticated
+            // request failed with "User not found or inactive", even for a
+            // genuinely active user right after a fresh login.
+            if (!user || !user.isActive) {
                 return res.status(401).json({
                     error: 'User not found or inactive'
                 });
@@ -73,7 +79,8 @@ class AuthMiddleware {
                 const payload = await pasetoService.verifyAccessToken(token);
                 if (payload) {
                     const user = await authService.getUserById(payload.sub);
-                    if (user && user.is_active) {
+                    // ✅ FIX: same camelCase correction as requireAuth above.
+                    if (user && user.isActive) {
                         req.user = user;
                     }
                 }
