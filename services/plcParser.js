@@ -1,4 +1,3 @@
-// backend/services/plcService.js
 'use strict';
 
 const fs = require('fs');
@@ -18,7 +17,6 @@ const MIN_VALID_ABS_VALUE = Number(process.env.MIN_VALID_ABS_VALUE) || 1e-6;
 const latest = {};
 let dataCount = 0;
 
-/* ------------------ DB write downsampling ------------------ */
 const DB_SAMPLE_INTERVAL_MS = Number(process.env.DB_SAMPLE_INTERVAL_MS) || 30000;
 
 const lastDbWriteTime = {};
@@ -44,8 +42,6 @@ function shouldWriteToDb(parameter, value, dataType) {
   }
   return false;
 }
-
-/* ------------------ buffer / hex helpers ------------------ */
 
 function isHexString(s) {
   return typeof s === 'string' && s.length > 0 && s.length % 2 === 0 && /^[0-9A-Fa-f]+$/.test(s);
@@ -93,8 +89,6 @@ function peelHexLayers(initialBuf, maxLayers = 4) {
   }
   return { buffer: buf, layersPeeled };
 }
-
-/* ------------------ named-record parser (siemens200smart style) ------------------ */
 
 function isPrintableAscii(buf) {
   if (!Buffer.isBuffer(buf) || buf.length === 0) return false;
@@ -193,8 +187,6 @@ function parseNamedRecords(buf) {
   return records;
 }
 
-/* ------------------ legacy heuristic parser (fallback) ------------------ */
-
 function tryReadFloatAt(buf, offset) {
   if (!Buffer.isBuffer(buf)) return { ok: false };
   if (offset < 0 || offset + 4 > buf.length) return { ok: false };
@@ -260,8 +252,6 @@ function parseAboxPayload(buf) {
   return measurements;
 }
 
-/* ------------------ legacy calibration support ------------------ */
-
 function readByMethod(buf, offset, method) {
   try {
     if (method === 'floatLE') return buf.readFloatLE(offset);
@@ -306,8 +296,6 @@ function loadCalibration() {
 }
 loadCalibration();
 
-/* ------------------ misc helpers ------------------ */
-
 function isValidParameterName(name) {
   if (!name || typeof name !== 'string') return false;
   const trimmed = name.trim();
@@ -346,27 +334,21 @@ function recordToDB(record) {
   return saveMeasurement(payload);
 }
 
-/* ------------------ PROCESSING PIPELINE ------------------ */
-
 function processMeasurement(topic, measurement, idx, rawBuf) {
   let parameter = measurement.parameter || parameterFromTopic(topic) || null;
 
-  // ✅ MAP AntiscalantDoser to the correct parameter name
   if (parameter === 'AntiscalantDoser' || parameter === 'DosingActive' || 
       parameter === 'Doser' || parameter === 'Dosing' || parameter === 'Antiscalant') {
     parameter = 'AntiscalantDosingActive';
   }
 
-  // ✅ ADD THIS - SCALE FEED TANK LEVEL
-  // Raw value 8.06 → Scaled 63.1% (multiply by 7.83)
   if (parameter === 'RO5-FeedTankLevel' || parameter === 'FeedTankLevel' || 
       parameter === 'FT-A' || parameter === 'FeedTank') {
     const rawValue = measurement.value;
-    const scaledValue = rawValue * 7.83; // 8.06 * 7.83 = 63.1%
+    const scaledValue = rawValue * 7.83;
     
     console.log(`[plc] 📊 Feed Tank: Raw=${rawValue} → Scaled=${scaledValue}%`);
     
-    // Send scaled value as the main feed tank level
     const scaledRecord = {
       topic,
       parameter: 'RO5-FeedTankLevel',
@@ -378,7 +360,6 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       debug: { ...measurement.debug, rawValue, scaledValue, scaleFactor: 7.83 }
     };
     
-    // Also keep raw value for debugging
     const rawRecord = {
       topic,
       parameter: 'RO5-FeedTankLevelRaw',
@@ -390,15 +371,12 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       debug: measurement.debug
     };
     
-    // Store in latest
     latest[scaledRecord.parameter] = scaledRecord;
     latest[rawRecord.parameter] = rawRecord;
     
-    // Broadcast both
     broadcast('plc-data', scaledRecord);
     broadcast('plc-data', rawRecord);
     
-    // Save to DB with scaling
     if (shouldWriteToDb('RO5-FeedTankLevel', scaledValue, 'float')) {
       recordToDB(scaledRecord).catch((err) => {
         if (dataCount % 100 === 0) {
@@ -407,7 +385,6 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       });
     }
     
-    // Also save raw
     if (shouldWriteToDb('RO5-FeedTankLevelRaw', rawValue, 'float')) {
       recordToDB(rawRecord).catch((err) => {
         if (dataCount % 100 === 0) {
@@ -416,7 +393,6 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       });
     }
     
-    // Skip normal processing since we handled it
     return;
   }
 
@@ -469,8 +445,6 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
   }
 }
 
-/* ------------------ MAIN HANDLER ------------------ */
-
 function handleIncoming(topic, raw) {
   const rawBuf = bufferFromRaw(raw);
 
@@ -496,11 +470,9 @@ function handleIncoming(topic, raw) {
 
   let parsedList = [];
 
-  // 1) Primary: named-record parser (siemens200smart tag format)
   parsedList = parseNamedRecords(decodedBuf);
   if (DEBUG_PARSE) console.debug('[plcService] named-record parser rows:', parsedList.length);
 
-  // 2) Fallback: legacy calibration (D-code offsets)
   if ((!parsedList || parsedList.length === 0) && calibration && Object.keys(calibration).length > 0) {
     try {
       parsedList = parseWithCalibration(decodedBuf, calibration);
@@ -510,7 +482,6 @@ function handleIncoming(topic, raw) {
     }
   }
 
-  // 3) Fallback: legacy heuristic D-code + nearest-float search
   if (!parsedList || parsedList.length === 0) {
     try {
       parsedList = parseAboxPayload(decodedBuf);
@@ -526,7 +497,6 @@ function handleIncoming(topic, raw) {
     return;
   }
 
-  // ✅ CONVERT BIT VALUES TO ON/OFF
   parsedList.forEach((record) => {
     const isAntiscalant = record.parameter === 'AntiscalantDoser' ||
                           record.parameter === 'AntiscalantDosingActive' ||
@@ -541,7 +511,6 @@ function handleIncoming(topic, raw) {
       record.dataType = 'bit';
       console.log(`[plc] 🔄 Converted ${record.parameter} to: ${record.value}`);
       
-      // Ensure consistent naming
       if (isAntiscalant) {
         record.parameter = 'AntiscalantDosingActive';
       }
@@ -557,8 +526,6 @@ function handleIncoming(topic, raw) {
   });
 }
 
-/* ------------------ SNAPSHOT GETTERS ------------------ */
-
 function getLatestSnapshot() {
   const out = {};
   for (const [k, v] of Object.entries(latest)) out[k] = v.value;
@@ -568,8 +535,6 @@ function getLatestSnapshot() {
 function getLatestFull() { return latest; }
 
 function getCalibration() { return calibration; }
-
-/* ------------------ EXPORTS ------------------ */
 
 module.exports = {
   handleIncoming,
