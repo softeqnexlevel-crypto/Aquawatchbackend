@@ -19,26 +19,11 @@ const latest = {};
 let dataCount = 0;
 
 /* ------------------ DB write downsampling ------------------ */
-// The live dashboard reads from `latest` / socket broadcasts (unthrottled,
-// still updated on every single message). This section only controls how
-// often a row actually gets persisted to Postgres, to prevent the
-// measurements table from growing unbounded (see DB_SAMPLE_INTERVAL_MS).
-
-const DB_SAMPLE_INTERVAL_MS = Number(process.env.DB_SAMPLE_INTERVAL_MS) || 30000; // 30s default
+const DB_SAMPLE_INTERVAL_MS = Number(process.env.DB_SAMPLE_INTERVAL_MS) || 30000;
 
 const lastDbWriteTime = {};
-const lastDbWrittenValue = {}; // tracks last value actually persisted, per parameter
+const lastDbWrittenValue = {};
 
-// For continuous numeric readings, only write once per DB_SAMPLE_INTERVAL_MS —
-// they change gradually, so periodic sampling loses nothing meaningful.
-//
-// For bit/status parameters (dosing ON/OFF, system operation/mode, etc.),
-// ALWAYS write immediately when the value actually changes, regardless of
-// timing — a fixed time window could otherwise miss a quick ON→OFF→ON
-// transition entirely, or leave stale state sitting in history for up to
-// DB_SAMPLE_INTERVAL_MS. Time-based throttling still applies to bit
-// parameters too, but only to suppress redundant writes of an UNCHANGED
-// value, never to skip a genuine transition.
 function shouldWriteToDb(parameter, value, dataType) {
   const now = Date.now();
   const last = lastDbWriteTime[parameter] || 0;
@@ -48,10 +33,8 @@ function shouldWriteToDb(parameter, value, dataType) {
     if (valueChanged) {
       lastDbWriteTime[parameter] = now;
       lastDbWrittenValue[parameter] = value;
-      return true; // always capture a real transition, no matter how recent the last write was
+      return true;
     }
-    // Unchanged bit value — still fall through to normal time-based
-    // throttling below, so an unchanging status doesn't spam the DB either.
   }
 
   if (now - last >= DB_SAMPLE_INTERVAL_MS) {
@@ -125,10 +108,6 @@ function readFloatBADC(buf, offset) {
   return Buffer.from([b1, b0, b3, b2]).readFloatLE(0);
 }
 
-/**
- * Parse the level-2 binary buffer into named tag readings.
- * Now handles both float32 (4 bytes) and bit/byte (1 byte) values.
- */
 function parseNamedRecords(buf) {
   if (!Buffer.isBuffer(buf) || buf.length < 20) return [];
 
@@ -156,15 +135,12 @@ function parseNamedRecords(buf) {
 
     try {
       if (lenByte === 4) {
-        // Float32 (4 bytes)
         value = readFloatBADC(buf, i + 13);
         dataType = 'float';
       } else if (lenByte === 1) {
-        // Bit/Byte (1 byte)
         value = buf[i + 13] || 0;
         dataType = 'bit';
       } else {
-        // Unknown type, skip
         continue;
       }
     } catch (_) {
@@ -376,8 +352,72 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
   let parameter = measurement.parameter || parameterFromTopic(topic) || null;
 
   // ✅ MAP AntiscalantDoser to the correct parameter name
-  if (parameter === 'AntiscalantDoser' || parameter === 'DosingActive') {
+  if (parameter === 'AntiscalantDoser' || parameter === 'DosingActive' || 
+      parameter === 'Doser' || parameter === 'Dosing' || parameter === 'Antiscalant') {
     parameter = 'AntiscalantDosingActive';
+  }
+
+  // ✅ ADD THIS - SCALE FEED TANK LEVEL
+  // Raw value 8.06 → Scaled 63.1% (multiply by 7.83)
+  if (parameter === 'RO5-FeedTankLevel' || parameter === 'FeedTankLevel' || 
+      parameter === 'FT-A' || parameter === 'FeedTank') {
+    const rawValue = measurement.value;
+    const scaledValue = rawValue * 7.83; // 8.06 * 7.83 = 63.1%
+    
+    console.log(`[plc] 📊 Feed Tank: Raw=${rawValue} → Scaled=${scaledValue}%`);
+    
+    // Send scaled value as the main feed tank level
+    const scaledRecord = {
+      topic,
+      parameter: 'RO5-FeedTankLevel',
+      unit: '%',
+      value: scaledValue,
+      timestamp: measurement.timestamp || new Date().toISOString(),
+      simulated: !!measurement.simulated,
+      dataType: 'float',
+      debug: { ...measurement.debug, rawValue, scaledValue, scaleFactor: 7.83 }
+    };
+    
+    // Also keep raw value for debugging
+    const rawRecord = {
+      topic,
+      parameter: 'RO5-FeedTankLevelRaw',
+      unit: '%',
+      value: rawValue,
+      timestamp: measurement.timestamp || new Date().toISOString(),
+      simulated: !!measurement.simulated,
+      dataType: 'float',
+      debug: measurement.debug
+    };
+    
+    // Store in latest
+    latest[scaledRecord.parameter] = scaledRecord;
+    latest[rawRecord.parameter] = rawRecord;
+    
+    // Broadcast both
+    broadcast('plc-data', scaledRecord);
+    broadcast('plc-data', rawRecord);
+    
+    // Save to DB with scaling
+    if (shouldWriteToDb('RO5-FeedTankLevel', scaledValue, 'float')) {
+      recordToDB(scaledRecord).catch((err) => {
+        if (dataCount % 100 === 0) {
+          console.error('[db] save failed (continuing):', err && err.message ? err.message : err);
+        }
+      });
+    }
+    
+    // Also save raw
+    if (shouldWriteToDb('RO5-FeedTankLevelRaw', rawValue, 'float')) {
+      recordToDB(rawRecord).catch((err) => {
+        if (dataCount % 100 === 0) {
+          console.error('[db] save failed (continuing):', err && err.message ? err.message : err);
+        }
+      });
+    }
+    
+    // Skip normal processing since we handled it
+    return;
   }
 
   if (!isValidParameterName(parameter)) {
@@ -409,11 +449,6 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     return;
   }
 
-  // ✅ Downsample DB writes — the live dashboard reads from `latest` /
-  // socket broadcasts below (unthrottled), so this only affects how much
-  // history piles up in Postgres, not real-time responsiveness. Bit/status
-  // parameters bypass the timer on a genuine value change (see
-  // shouldWriteToDb above), so ON/OFF transitions are never missed.
   if (shouldWriteToDb(parameter, record.value, record.dataType)) {
     recordToDB(record).catch((err) => {
       if (dataCount % 100 === 0) {
@@ -423,7 +458,6 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
   }
 
   try {
-    // Alarm evaluation only makes sense for numeric readings
     const alarms = record.dataType === 'bit' ? [] : evaluate(parameter, record.value);
     broadcast('plc-data', record);
     if (alarms && alarms.length) {
@@ -492,23 +526,25 @@ function handleIncoming(topic, raw) {
     return;
   }
 
-  // ✅ CONVERT BIT VALUES TO ON/OFF — ONLY FOR KNOWN BOOLEAN PARAMETERS.
-  // IMPORTANT: never infer "this is a boolean" purely from the value being 0 or 1 —
-  // that misfires on any numeric sensor (flow, pressure, etc.) that legitimately
-  // reads exactly 0 or 1, silently turning a number into the string "ON"/"OFF"
-  // and breaking anything downstream that expects a number (e.g. .toFixed()).
+  // ✅ CONVERT BIT VALUES TO ON/OFF
   parsedList.forEach((record) => {
     const isAntiscalant = record.parameter === 'AntiscalantDoser' ||
                           record.parameter === 'AntiscalantDosingActive' ||
                           record.parameter === 'DosingActive' ||
                           record.parameter === 'Doser' ||
-                          record.parameter === 'Dosing';
+                          record.parameter === 'Dosing' ||
+                          record.parameter === 'Antiscalant';
 
     if (isAntiscalant || record.dataType === 'bit') {
       record.value = record.value === 1 ? 'ON' : 'OFF';
       record.unit = '';
       record.dataType = 'bit';
       console.log(`[plc] 🔄 Converted ${record.parameter} to: ${record.value}`);
+      
+      // Ensure consistent naming
+      if (isAntiscalant) {
+        record.parameter = 'AntiscalantDosingActive';
+      }
     }
   });
 
@@ -540,6 +576,5 @@ module.exports = {
   getLatestSnapshot,
   getLatestFull,
   getCalibration,
-  // exposed for testing/debugging
   _internal: { peelHexLayers, parseNamedRecords, hexdump }
 };
