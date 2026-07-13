@@ -14,6 +14,28 @@ const ARCHIVE_RAW_FAILED = Boolean(process.env.ARCHIVE_RAW_FAILED && process.env
 const CALIBRATION_FILE = process.env.CALIBRATION_FILE || path.resolve(__dirname, '..', 'data', 'calibration.json');
 const MIN_VALID_ABS_VALUE = Number(process.env.MIN_VALID_ABS_VALUE) || 1e-6;
 
+// ============================================================
+// ✅ NEW: file-based debug logger. Writes directly via fs, so it
+// works regardless of shell/TTY/winpty redirection issues on
+// Windows git-bash. Always-on (not gated behind DEBUG_PARSE) so
+// we can trace exactly what happens to specific records like
+// AntiscalantDoser without needing env vars or terminal redirects.
+// Log file: backend/debug.log
+// ============================================================
+const DEBUG_LOG_FILE = path.resolve(__dirname, '..', 'debug.log');
+
+function dlog(...args) {
+  try {
+    const line = `[${new Date().toISOString()}] ${args
+      .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+      .join(' ')}\n`;
+    fs.appendFileSync(DEBUG_LOG_FILE, line);
+  } catch (err) {
+    // Never let logging crash the app
+    console.error('[dlog] failed to write debug log:', err && err.message ? err.message : err);
+  }
+}
+
 const latest = {};
 let dataCount = 0;
 
@@ -135,14 +157,28 @@ function parseNamedRecords(buf) {
         value = buf[i + 13] || 0;
         dataType = 'bit';
       } else {
+        // ✅ NEW: log unhandled lenByte values so we can see if
+        // AntiscalantDoser's record uses a length we don't handle at all
+        // (e.g. 2-byte word) and is being skipped before name resolution
+        // even starts.
+        dlog('SKIPPED-UNHANDLED-LEN', { offset: i, recordIndex, typeByte, lenByte });
         continue;
       }
     } catch (_) {
       continue;
     }
 
-    const nameLenDeclared = buf[i + 17];
-    const nameStartBase = i + 18;
+    // ✅ FIX: these were hardcoded as i+17 / i+18, which only happens to be
+    // correct for 4-byte float records (13 + 4 = 17). For 1-byte bit
+    // records, the value only occupies byte i+13, so the next field
+    // actually starts at i+14 — the old hardcoded offsets read 3 bytes into
+    // the wrong location for every bit-type record (AntiscalantDosingActive,
+    // SystemOperation, SystemMode), corrupting name/unit resolution for all
+    // of them. Computing the offset from the real value length (lenByte)
+    // fixes bit records while leaving float records completely unchanged
+    // (13 + 4 + 1 = 18, same as before).
+    const nameLenDeclared = buf[i + 13 + lenByte];
+    const nameStartBase = i + 13 + lenByte + 1;
 
     let parsed = null;
     for (const delta of [0, -1, 1, -2, 2]) {
@@ -167,9 +203,31 @@ function parseNamedRecords(buf) {
     }
 
     if (!parsed) {
-      if (DEBUG_PARSE) console.warn(`[plc] record at offset ${i} (index ${recordIndex}) could not resolve name/unit; skipping`);
+      // ✅ CHANGED: was gated behind `if (DEBUG_PARSE)` using console.warn.
+      // Now always writes to debug.log via dlog(), plus a small hexdump
+      // slice around the failed record so we can inspect the actual bytes
+      // without needing to re-run with DEBUG_PARSE or fight shell redirects.
+      const sliceStart = Math.max(0, i);
+      const sliceEnd = Math.min(buf.length, nextMarker);
+      const rawSlice = buf.slice(sliceStart, sliceEnd);
+      dlog('DROPPED-NAME-UNRESOLVED', {
+        offset: i,
+        recordIndex,
+        typeByte,
+        lenByte,
+        dataType,
+        value,
+        nameLenDeclared,
+        hex: rawSlice.toString('hex'),
+        ascii: rawSlice.toString('ascii').replace(/[^\x20-\x7E]/g, '.')
+      });
       continue;
     }
+
+    // ✅ NEW: log every successfully resolved record so we can confirm
+    // exactly which parameter names come out of the parser each cycle,
+    // and cross-check whether "AntiscalantDoser" appears here at all.
+    dlog('RESOLVED', { offset: i, recordIndex, name: parsed.name, unit: parsed.unit, value, dataType });
 
     records.push({
       parameter: parsed.name,
@@ -183,6 +241,10 @@ function parseNamedRecords(buf) {
       debug: { offset: i, recordIndex, dataType }
     });
   }
+
+  // ✅ NEW: summary line per payload — markers found vs records resolved.
+  // If these numbers don't match, records are being silently dropped.
+  dlog('SUMMARY', { markersFound: markers.length, recordsResolved: records.length });
 
   return records;
 }
@@ -339,6 +401,9 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
 
   if (parameter === 'AntiscalantDoser' || parameter === 'DosingActive' || 
       parameter === 'Doser' || parameter === 'Dosing' || parameter === 'Antiscalant') {
+    // ✅ NEW: log every time an antiscalant alias is recognized here, so we
+    // can confirm processMeasurement is actually being reached for it.
+    dlog('ANTISCALANT-ALIAS-MATCHED', { originalParameter: parameter, topic, value: measurement.value });
     parameter = 'AntiscalantDosingActive';
   }
 
@@ -346,9 +411,9 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       parameter === 'FT-A' || parameter === 'FeedTank') {
     const rawValue = measurement.value;
     const scaledValue = rawValue * 7.83;
-    
+
     console.log(`[plc] 📊 Feed Tank: Raw=${rawValue} → Scaled=${scaledValue}%`);
-    
+
     const scaledRecord = {
       topic,
       parameter: 'RO5-FeedTankLevel',
@@ -359,7 +424,7 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       dataType: 'float',
       debug: { ...measurement.debug, rawValue, scaledValue, scaleFactor: 7.83 }
     };
-    
+
     const rawRecord = {
       topic,
       parameter: 'RO5-FeedTankLevelRaw',
@@ -370,13 +435,13 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       dataType: 'float',
       debug: measurement.debug
     };
-    
+
     latest[scaledRecord.parameter] = scaledRecord;
     latest[rawRecord.parameter] = rawRecord;
-    
+
     broadcast('plc-data', scaledRecord);
     broadcast('plc-data', rawRecord);
-    
+
     if (shouldWriteToDb('RO5-FeedTankLevel', scaledValue, 'float')) {
       recordToDB(scaledRecord).catch((err) => {
         if (dataCount % 100 === 0) {
@@ -384,7 +449,7 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
         }
       });
     }
-    
+
     if (shouldWriteToDb('RO5-FeedTankLevelRaw', rawValue, 'float')) {
       recordToDB(rawRecord).catch((err) => {
         if (dataCount % 100 === 0) {
@@ -392,11 +457,15 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
         }
       });
     }
-    
+
     return;
   }
 
   if (!isValidParameterName(parameter)) {
+    // ✅ NEW: log when a parameter name fails validation and gets
+    // overwritten with a generic "unknown_N" fallback — this would also
+    // explain data silently disappearing under a useless key.
+    dlog('INVALID-PARAMETER-NAME', { original: parameter, topic });
     parameter = parameterFromTopic(topic) || `unknown_${idx || 'x'}`;
   }
 
@@ -462,11 +531,31 @@ function handleIncoming(topic, raw) {
 
   if (!rawBuf) return;
 
+  // ✅ NEW: unconditional raw-payload logging (ASCII form) so we can grep
+  // debug.log for "Antiscalant" and see immediately whether the string
+  // shows up anywhere in what the ABox actually sent, independent of
+  // whether the parser succeeds in extracting it as a record.
+  dlog('INCOMING', {
+    topic,
+    bytes: rawBuf.length,
+    ascii: rawBuf.toString('ascii').replace(/[^\x20-\x7E]/g, '.')
+  });
+
   const { buffer: decodedBuf, layersPeeled } = peelHexLayers(rawBuf);
   if (DEBUG_PARSE || LOG_RAW) {
     console.log(`[plc] peeled ${layersPeeled} hex layer(s), decoded length=${decodedBuf.length}`);
     if (DEBUG_PARSE) console.debug('[plc] decoded hexdump head:\n' + hexdump(decodedBuf, 256));
   }
+
+  // ✅ NEW: also log the decoded (post hex-peel) ASCII — this is the buffer
+  // that parseNamedRecords actually scans, so if "Antiscalant" appears in
+  // INCOMING but not here, the hex-peeling step is corrupting/eating it.
+  dlog('DECODED', {
+    topic,
+    layersPeeled,
+    bytes: decodedBuf.length,
+    ascii: decodedBuf.toString('ascii').replace(/[^\x20-\x7E]/g, '.')
+  });
 
   let parsedList = [];
 
@@ -493,29 +582,37 @@ function handleIncoming(topic, raw) {
 
   if (!parsedList || parsedList.length === 0) {
     console.warn('[plcService] no parse results for topic', topic, '- archiving raw for analysis');
+    dlog('NO-PARSE-RESULTS', { topic });
     archiveRawPayload(topic, rawBuf);
     return;
   }
 
-  parsedList.forEach((record) => {
-    const isAntiscalant = record.parameter === 'AntiscalantDoser' ||
-                          record.parameter === 'AntiscalantDosingActive' ||
-                          record.parameter === 'DosingActive' ||
-                          record.parameter === 'Doser' ||
-                          record.parameter === 'Dosing' ||
-                          record.parameter === 'Antiscalant';
+ parsedList.forEach((record) => {
+  const isAntiscalant = record.parameter === 'AntiscalantDoser' ||
+                        record.parameter === 'AntiscalantDosingActive' ||
+                        record.parameter === 'DosingActive' ||
+                        record.parameter === 'Doser' ||
+                        record.parameter === 'Dosing' ||
+                        record.parameter === 'Antiscalant';
 
-    if (isAntiscalant || record.dataType === 'bit') {
-      record.value = record.value === 1 ? 'ON' : 'OFF';
-      record.unit = '';
-      record.dataType = 'bit';
-      console.log(`[plc] 🔄 Converted ${record.parameter} to: ${record.value}`);
-      
-      if (isAntiscalant) {
-        record.parameter = 'AntiscalantDosingActive';
-      }
+  if (isAntiscalant || record.dataType === 'bit') {
+    record.value = record.value === 1 ? 'ON' : 'OFF';
+    record.unit = '';
+    record.dataType = 'bit';
+    console.log(`[plc] 🔄 Converted ${record.parameter} to: ${record.value}`);
+
+    if (isAntiscalant) {
+      dlog('ANTISCALANT-BIT-CONVERTED', { originalParameter: record.parameter, value: record.value });
+      record.parameter = 'AntiscalantDosingActive';
     }
-  });
+  }
+
+  // ✅ ADD THIS RIGHT HERE
+  if (record.parameter === 'AntiscalantDosingActive') {
+    record.value = 'ON';
+    console.log('🔴 FORCED ANTISCALANT TO ON FOR TESTING');
+  }
+});
 
   parsedList.forEach((m, idx) => {
     try {
