@@ -18,7 +18,7 @@ const app = express();
 
 // ==================== CORS CONFIG ====================
 const allowedOrigins = [
-  'https://aquasystemtech.co.ke',
+  'https://www.aquasystemtech.co.ke',
     'https://aquawatch-flax-nine.vercel.app',
     'http://localhost:3000',
     'http://localhost:5173',
