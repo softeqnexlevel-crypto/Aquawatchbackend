@@ -15,7 +15,7 @@ const db = require('../database/postgres');
    ============================================================ */
 
 const DEFAULT_USERS = [
-    { email: 'admin@aquaops.co.ke', password: 'admin123', firstName: 'John', lastName: 'Mwangi', role: 'admin' },
+    { email: 'aquasystemtech.co.ke@gmail.com', password: 'admin123', firstName: 'David', lastName: '', role: 'admin' },
     { email: 'operator@aquaops.co.ke', password: 'operator123', firstName: 'Grace', lastName: 'Wanjiku', role: 'operator' },
     { email: 'client@aquaops.co.ke', password: 'client123', firstName: 'Peter', lastName: 'Kamau', role: 'client' },
 ];
@@ -169,6 +169,16 @@ class AuthService {
         if (typeof updates.lastName !== 'undefined') patch.lastName = updates.lastName;
         if (typeof updates.role !== 'undefined') patch.role = updates.role;
         if (typeof updates.isActive !== 'undefined') patch.isActive = updates.isActive;
+
+        // Email updates: guard against colliding with another account before
+        // writing, since email is the unique login identifier.
+        if (typeof updates.email !== 'undefined') {
+            const existing = await db.findUserByEmail(updates.email);
+            if (existing && existing.id !== id) {
+                throw new Error('Email already in use by another account');
+            }
+            patch.email = updates.email;
+        }
 
         const user = await db.updateUser(id, patch);
         if (!user) throw new Error('User not found');
