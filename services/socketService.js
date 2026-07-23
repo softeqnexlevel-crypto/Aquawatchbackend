@@ -28,7 +28,8 @@ function initSocket(io) {
 
     // Send latest data
     try {
-      const { getLatestFull } = require("./plcService");
+      // const { getLatestFull } = require("./plcService");
+      const { getLatestFull } = require("./plcParser");
       const latest = getLatestFull();
       const keys = Object.keys(latest);
       console.log(`[socket] 📊 Sending ${keys.length} readings to client`);

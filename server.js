@@ -12,33 +12,33 @@ const { initMqtt, getStatus } = require("./mqtt/mqttClient");
 const { initSocket, broadcastMqttStatus } = require("./services/socketService");
 const { initDb } = require("./database/postgres");
 const apiRoutes = require("./routes/api");
-const authService = require("./services/auth.service"); // ✅ ADDED
+const authService = require("./services/auth.service");
 
 const app = express();
 
 // ==================== CORS CONFIG ====================
 const allowedOrigins = [
   'https://www.aquasystemtech.co.ke',
-    'https://aquawatch-flax-nine.vercel.app',
-    'http://localhost:3000',
-    'http://localhost:5173',
-    'http://localhost:3001'
+  'https://aquawatch-flax-nine.vercel.app',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://localhost:3001'
 ];
 
 const corsOptions = {
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            console.warn(`[CORS] Blocked origin: ${origin}`);
-            callback(null, false);
-        }
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
-    exposedHeaders: ['Content-Length', 'X-Request-Id'],
-    optionsSuccessStatus: 200
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`[CORS] Blocked origin: ${origin}`);
+      callback(null, false);
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
+  exposedHeaders: ['Content-Length', 'X-Request-Id'],
+  optionsSuccessStatus: 200
 };
 
 app.use(cors(corsOptions));
@@ -50,16 +50,16 @@ app.use("/api", apiRoutes);
 
 // 404 Handler
 app.use((req, res) => {
-  res.status(404).json({ 
-    error: `Not found: ${req.method} ${req.originalUrl}` 
+  res.status(404).json({
+    error: `Not found: ${req.method} ${req.originalUrl}`
   });
 });
 
 // Error Handler
 app.use((err, req, res, next) => {
   console.error("[api error]", err);
-  res.status(err.status || 500).json({ 
-    error: err.message || "Internal server error" 
+  res.status(err.status || 500).json({
+    error: err.message || "Internal server error"
   });
 });
 
@@ -78,26 +78,37 @@ const io = new Server(server, {
 });
 
 (async () => {
+  // ---- Database init (non-fatal if it fails) ----
   try {
     await initDb();
     console.log("[db] Database initialized successfully");
 
-    // ✅ ADDED — must run after initDb() resolves, since initUsers() queries
-    // the database. Calling this at module-require time (like the old
-    // auth.service.js used to) would race against initDb() and silently
-    // fail with "Database not initialized", leaving the users table empty
-    // forever — which is exactly what was happening.
+    // Must run after initDb() resolves, since initUsers() queries the
+    // database. Calling this at module-require time would race against
+    // initDb() and silently fail with "Database not initialized",
+    // leaving the users table empty forever.
     await authService.initUsers();
   } catch (err) {
     console.error("[db] init failed (continuing without persistence):", err.message);
   }
 
-  initSocket(io);
-  setTimeout(() => {
-    console.log('🔍 Socket clients:', io.sockets.sockets.size);
-    console.log('🔍 Socket namespaces:', io.nsps);
-  }, 2000);
-  initMqtt();
+  // ---- Socket.IO init (isolated so a failure here doesn't block server.listen) ----
+  try {
+    initSocket(io);
+    setTimeout(() => {
+      console.log('🔍 Socket clients:', io.sockets.sockets.size);
+      console.log('🔍 Socket namespaces:', io.nsps);
+    }, 2000);
+  } catch (err) {
+    console.error("[socket] init FAILED:", err);
+  }
+
+  // ---- MQTT init (isolated so a failure here doesn't block server.listen) ----
+  try {
+    initMqtt();
+  } catch (err) {
+    console.error("[mqtt] init FAILED:", err);
+  }
 
   setInterval(() => {
     broadcastMqttStatus();
@@ -108,7 +119,12 @@ const io = new Server(server, {
     console.log(`[http] listening on :${port}`);
     console.log(`[mqtt] Mode: ${getStatus().simulationMode ? '🎮 SIMULATION' : '📡 LIVE'}`);
   });
-})();
+})().catch(err => {
+  // Catches anything that slipped through the individual try/catch blocks
+  // above (or errors thrown by code between them) so a startup failure is
+  // always logged instead of dying as a silent unhandled rejection.
+  console.error("[startup] FATAL — server never started:", err);
+});
 
 // Graceful shutdown
 process.on('SIGINT', () => {

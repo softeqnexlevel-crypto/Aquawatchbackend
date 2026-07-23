@@ -176,7 +176,58 @@ const alertRules = pgTable('alert_rules', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 });
 
- 
+/* ============================================================
+   BILLING PLANS
+   Seeded rows: 'starter', 'growth', 'enterprise'. paystackPlanCode is
+   NULL for enterprise (no self-serve checkout — "Contact Us" instead).
+   ============================================================ */
+const billingPlans = pgTable('billing_plans', {
+  id: uuid('id').primaryKey(),
+  code: varchar('code', { length: 50 }).notNull().unique(),
+  name: varchar('name', { length: 100 }).notNull(),
+  paystackPlanCode: varchar('paystack_plan_code', { length: 100 }),
+  amountKes: doublePrecision('amount_kes').notNull().default(0),
+  interval: varchar('interval', { length: 20 }).notNull().default('monthly'),
+  features: jsonb('features').default([]),
+  isActive: boolean('is_active').default(true),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+});
+
+/* ============================================================
+   BILLING SUBSCRIPTIONS
+   ============================================================ */
+const billingSubscriptions = pgTable('billing_subscriptions', {
+  id: uuid('id').primaryKey(),
+  userId: uuid('user_id').notNull(),
+  planCode: varchar('plan_code', { length: 50 }).notNull(),
+  paystackCustomerCode: varchar('paystack_customer_code', { length: 100 }),
+  paystackSubscriptionCode: varchar('paystack_subscription_code', { length: 100 }),
+  paystackEmailToken: varchar('paystack_email_token', { length: 100 }),
+  status: varchar('status', { length: 20 }).notNull().default('inactive'),
+  currentPeriodEnd: timestamp('current_period_end', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+}, (table) => ({
+  userIdx: index('billing_subscriptions_user_idx').on(table.userId),
+}));
+
+/* ============================================================
+   BILLING HISTORY
+   ============================================================ */
+const billingHistory = pgTable('billing_history', {
+  id: uuid('id').primaryKey(),
+  userId: uuid('user_id').notNull(),
+  planCode: varchar('plan_code', { length: 50 }).notNull(),
+  planName: varchar('plan_name', { length: 100 }).notNull(),
+  amountKes: doublePrecision('amount_kes').notNull(),
+  paystackReference: varchar('paystack_reference', { length: 100 }).unique(),
+  status: varchar('status', { length: 20 }).notNull().default('processing'),
+  purchaseDate: timestamp('purchase_date', { withTimezone: true }).defaultNow(),
+  periodEnd: timestamp('period_end', { withTimezone: true }),
+}, (table) => ({
+  userDateIdx: index('billing_history_user_date_idx').on(table.userId, table.purchaseDate),
+}));
+
 const systemSettings = pgTable('system_settings', {
   
   id: integer('id').primaryKey(),
@@ -206,4 +257,7 @@ module.exports = {
   auditLogs,
   systemSettings,
   alertRules,
+  billingPlans,
+  billingSubscriptions,
+  billingHistory,
 };

@@ -633,6 +633,94 @@ async function saveSettings(data, userId) {
 }
 
 // ============================================================
+// REPOSITORY: BILLING
+// ============================================================
+
+async function getActiveBillingPlans() {
+    const db = getDb();
+    return db.select()
+        .from(schema.billingPlans)
+        .where(sql`${schema.billingPlans.isActive} = true`)
+        .orderBy(schema.billingPlans.amountKes, 'asc');
+}
+
+async function getBillingPlanByCode(code) {
+    const db = getDb();
+    const result = await db.select()
+        .from(schema.billingPlans)
+        .where(sql`${schema.billingPlans.code} = ${code} AND ${schema.billingPlans.isActive} = true`)
+        .limit(1);
+    return result[0] || null;
+}
+
+async function createBillingHistoryEntry(data) {
+    const db = getDb();
+    const result = await db.insert(schema.billingHistory).values({
+        id: generateUUID(),
+        userId: data.userId,
+        planCode: data.planCode,
+        planName: data.planName,
+        amountKes: data.amountKes,
+        paystackReference: data.paystackReference,
+        status: data.status || 'processing',
+    }).returning();
+    return result[0];
+}
+
+async function updateBillingHistoryStatus(paystackReference, status) {
+    const db = getDb();
+    const result = await db.update(schema.billingHistory)
+        .set({ status })
+        .where(sql`${schema.billingHistory.paystackReference} = ${paystackReference}`)
+        .returning();
+    return result[0] || null;
+}
+
+async function getBillingHistoryByUser(userId, limit = 50) {
+    const db = getDb();
+    return db.select()
+        .from(schema.billingHistory)
+        .where(sql`${schema.billingHistory.userId} = ${userId}`)
+        .orderBy(schema.billingHistory.purchaseDate, 'desc')
+        .limit(limit);
+}
+
+async function upsertActiveSubscription(data) {
+    const db = getDb();
+    await db.update(schema.billingSubscriptions)
+        .set({ status: 'replaced', updatedAt: new Date() })
+        .where(sql`${schema.billingSubscriptions.userId} = ${data.userId} AND ${schema.billingSubscriptions.status} = 'active'`);
+
+    const result = await db.insert(schema.billingSubscriptions).values({
+        id: generateUUID(),
+        userId: data.userId,
+        planCode: data.planCode,
+        paystackCustomerCode: data.paystackCustomerCode,
+        status: 'active',
+        currentPeriodEnd: data.currentPeriodEnd || null,
+    }).returning();
+    return result[0];
+}
+
+async function updateSubscriptionByCustomerCode(customerCode, data) {
+    const db = getDb();
+    const result = await db.update(schema.billingSubscriptions)
+        .set({ ...data, updatedAt: new Date() })
+        .where(sql`${schema.billingSubscriptions.paystackCustomerCode} = ${customerCode}`)
+        .returning();
+    return result[0] || null;
+}
+
+async function updateSubscriptionByCode(subscriptionCode, data) {
+    const db = getDb();
+    const result = await db.update(schema.billingSubscriptions)
+        .set({ ...data, updatedAt: new Date() })
+        .where(sql`${schema.billingSubscriptions.paystackSubscriptionCode} = ${subscriptionCode}`)
+        .returning();
+    return result[0] || null;
+}
+
+// ============================================================
 // EXPORTS
 // ============================================================
 
@@ -693,6 +781,16 @@ module.exports = {
     // setting
     getSettings,
     saveSettings,
+
+    // Billing
+    getActiveBillingPlans,
+    getBillingPlanByCode,
+    createBillingHistoryEntry,
+    updateBillingHistoryStatus,
+    getBillingHistoryByUser,
+    upsertActiveSubscription,
+    updateSubscriptionByCustomerCode,
+    updateSubscriptionByCode,
     
     // Schema
     schema,
