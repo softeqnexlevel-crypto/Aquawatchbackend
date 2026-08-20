@@ -34,15 +34,9 @@ async function initDb() {
             connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 5000,
             statement_timeout: 30000,
             query_timeout: 30000,
-<<<<<<< HEAD
            ssl: process.env.DB_SSL === 'true'
     ? { rejectUnauthorized: false }
     : false,
-=======
-            ssl: process.env.NODE_ENV === 'production' 
-                ? { rejectUnauthorized: false } 
-                : false,
->>>>>>> 13fc14314d7a2e189775b38a074b46d2541c8462
         });
 
         // Test connection
