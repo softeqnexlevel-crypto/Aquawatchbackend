@@ -1,5 +1,5 @@
 // backend/services/billing.service.js
-'use strict';
+// 'use strict';
 
 const crypto = require('crypto');
 const db = require('../database/postgres');

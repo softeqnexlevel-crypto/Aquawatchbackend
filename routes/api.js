@@ -3,7 +3,7 @@ const ctrl = require("../controllers/deviceController");
 const authRoutes = require("./auth.routes");
 const productionRoutes = require("./production.routes"); // ✅ ADDED
 const settingsRoutes = require("./settings.routes"); // ✅ ADDED
-const billingRoutes = require("./billing.routes"); // ✅ ADDED — exposes /api/billing/*
+const billingRoutes = require("./Billing.routes"); // ✅ ADDED — exposes /api/billing/*
 const aiRoutes = require("./ai"); // ✅ ADDED — exposes POST /api/ai/chat
 
 const router = express.Router();
