@@ -1,0 +1,142 @@
+{
+  "D1": {
+    "offset": 0,
+    "method": "floatLE",
+    "parameter": "Float_0",
+    "unit": "unknown",
+    "exampleValue": 704.769
+  },
+  "D2": {
+    "offset": 1,
+    "method": "floatLE",
+    "parameter": "Float_1",
+    "unit": "unknown",
+    "exampleValue": 784.753
+  },
+  "D3": {
+    "offset": 27,
+    "method": "floatLE",
+    "parameter": "Float_27",
+    "unit": "unknown",
+    "exampleValue": 45.047
+  },
+  "D4": {
+    "offset": 29,
+    "method": "floatLE",
+    "parameter": "Float_29",
+    "unit": "unknown",
+    "exampleValue": 182.259
+  },
+  "D5": {
+    "offset": 44,
+    "method": "floatLE",
+    "parameter": "Float_44",
+    "unit": "unknown",
+    "exampleValue": 728.831
+  },
+  "D6": {
+    "offset": 48,
+    "method": "floatLE",
+    "parameter": "Float_48",
+    "unit": "unknown",
+    "exampleValue": 2915.326
+  },
+  "D7": {
+    "offset": 60,
+    "method": "floatLE",
+    "parameter": "Float_60",
+    "unit": "unknown",
+    "exampleValue": 728.8
+  },
+  "D8": {
+    "offset": 68,
+    "method": "floatLE",
+    "parameter": "Float_68",
+    "unit": "unknown",
+    "exampleValue": 712.816
+  },
+  "D9": {
+    "offset": 80,
+    "method": "floatLE",
+    "parameter": "Float_80",
+    "unit": "unknown",
+    "exampleValue": 182.212
+  },
+  "D10": {
+    "offset": 82,
+    "method": "floatLE",
+    "parameter": "Float_82",
+    "unit": "unknown",
+    "exampleValue": 11664.803
+  },
+  "D11": {
+    "offset": 88,
+    "method": "floatLE",
+    "parameter": "Float_88",
+    "unit": "unknown",
+    "exampleValue": 728.815
+  },
+  "D12": {
+    "offset": 92,
+    "method": "floatLE",
+    "parameter": "Float_92",
+    "unit": "unknown",
+    "exampleValue": 11404.8
+  },
+  "D13": {
+    "offset": 107,
+    "method": "floatLE",
+    "parameter": "Float_107",
+    "unit": "unknown",
+    "exampleValue": 708.753
+  },
+  "D14": {
+    "offset": 136,
+    "method": "floatLE",
+    "parameter": "Float_136",
+    "unit": "unknown",
+    "exampleValue": 44.797
+  },
+  "D15": {
+    "offset": 142,
+    "method": "floatLE",
+    "parameter": "Float_142",
+    "unit": "unknown",
+    "exampleValue": 177.192
+  },
+  "D16": {
+    "offset": 182,
+    "method": "floatLE",
+    "parameter": "Float_182",
+    "unit": "unknown",
+    "exampleValue": 728.785
+  },
+  "D17": {
+    "offset": 202,
+    "method": "floatLE",
+    "parameter": "Float_202",
+    "unit": "unknown",
+    "exampleValue": 720.815
+  },
+  "D18": {
+    "offset": 249,
+    "method": "floatLE",
+    "parameter": "Float_249",
+    "unit": "unknown",
+    "exampleValue": 11.579
+  },
+  "D19": {
+    "offset": 254,
+    "method": "floatLE",
+    "parameter": "Float_254",
+    "unit": "unknown",
+    "exampleValue": 11852.301
+  },
+  "D20": {
+    "offset": 256,
+    "method": "floatLE",
+    "parameter": "Float_256",
+    "unit": "unknown",
+    "exampleValue": 2836.389
+  }
+}

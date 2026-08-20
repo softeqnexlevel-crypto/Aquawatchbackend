@@ -1,0 +1,642 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+const { parameterFromTopic, KNOWN_PARAMETERS } = require('../mqtt/topicManager');
+const { broadcast } = require('./socketService');
+const { evaluate } = require('./alarmService');
+const { saveMeasurement } = require('../database/postgres');
+
+const DEBUG_PARSE = Boolean(process.env.DEBUG_PARSE && process.env.DEBUG_PARSE !== '0');
+const LOG_RAW = process.env.LOG_RAW === undefined ? true : process.env.LOG_RAW !== '0';
+const ARCHIVE_RAW_FAILED = Boolean(process.env.ARCHIVE_RAW_FAILED && process.env.ARCHIVE_RAW_FAILED !== '0');
+const CALIBRATION_FILE = process.env.CALIBRATION_FILE || path.resolve(__dirname, '..', 'data', 'calibration.json');
+const MIN_VALID_ABS_VALUE = Number(process.env.MIN_VALID_ABS_VALUE) || 1e-6;
+
+// ============================================================
+// ✅ NEW: file-based debug logger. Writes directly via fs, so it
+// works regardless of shell/TTY/winpty redirection issues on
+// Windows git-bash. Always-on (not gated behind DEBUG_PARSE) so
+// we can trace exactly what happens to specific records like
+// AntiscalantDoser without needing env vars or terminal redirects.
+// Log file: backend/debug.log
+// ============================================================
+const DEBUG_LOG_FILE = path.resolve(__dirname, '..', 'debug.log');
+
+function dlog(...args) {
+  try {
+    const line = `[${new Date().toISOString()}] ${args
+      .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
+      .join(' ')}\n`;
+    fs.appendFileSync(DEBUG_LOG_FILE, line);
+  } catch (err) {
+    // Never let logging crash the app
+    console.error('[dlog] failed to write debug log:', err && err.message ? err.message : err);
+  }
+}
+
+const latest = {};
+let dataCount = 0;
+
+const DB_SAMPLE_INTERVAL_MS = Number(process.env.DB_SAMPLE_INTERVAL_MS) || 30000;
+
+const lastDbWriteTime = {};
+const lastDbWrittenValue = {};
+
+function shouldWriteToDb(parameter, value, dataType) {
+  const now = Date.now();
+  const last = lastDbWriteTime[parameter] || 0;
+  const valueChanged = lastDbWrittenValue[parameter] !== value;
+
+  if (dataType === 'bit') {
+    if (valueChanged) {
+      lastDbWriteTime[parameter] = now;
+      lastDbWrittenValue[parameter] = value;
+      return true;
+    }
+  }
+
+  if (now - last >= DB_SAMPLE_INTERVAL_MS) {
+    lastDbWriteTime[parameter] = now;
+    lastDbWrittenValue[parameter] = value;
+    return true;
+  }
+  return false;
+}
+
+function isHexString(s) {
+  return typeof s === 'string' && s.length > 0 && s.length % 2 === 0 && /^[0-9A-Fa-f]+$/.test(s);
+}
+
+function bufferFromRaw(raw) {
+  if (raw == null) return null;
+  if (Buffer.isBuffer(raw)) return raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed === '') return null;
+    return Buffer.from(trimmed, 'utf8');
+  }
+  try { return Buffer.from(String(raw)); } catch (_) { return null; }
+}
+
+function hexdump(buf, maxBytes = 256) {
+  if (!Buffer.isBuffer(buf)) return '';
+  const lines = [];
+  for (let i = 0; i < Math.min(buf.length, maxBytes); i += 16) {
+    const slice = buf.slice(i, Math.min(i + 16, buf.length));
+    const hex = slice.toString('hex').match(/.{1,2}/g).join(' ');
+    const ascii = slice.toString('ascii').replace(/[^\x20-\x7E]/g, '.');
+    lines.push(`${i.toString(16).padStart(4, '0')}  ${hex.padEnd(16 * 3 - 1)}  ${ascii}`);
+  }
+  return lines.join('\n');
+}
+
+function peelHexLayers(initialBuf, maxLayers = 4) {
+  let buf = initialBuf;
+  let layersPeeled = 0;
+  for (let layer = 0; layer < maxLayers; layer++) {
+    if (!Buffer.isBuffer(buf) || buf.length === 0) break;
+    const asAscii = buf.toString('ascii');
+    const cleaned = asAscii.replace(/[^0-9A-Fa-f]+$/, '');
+    if (cleaned.length < 8) break;
+    if (!isHexString(cleaned)) break;
+    try {
+      const decoded = Buffer.from(cleaned, 'hex');
+      buf = decoded;
+      layersPeeled++;
+    } catch (_) {
+      break;
+    }
+  }
+  return { buffer: buf, layersPeeled };
+}
+
+function isPrintableAscii(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length === 0) return false;
+  const s = buf.toString('ascii');
+  return /^[\x20-\x7E]+$/.test(s);
+}
+
+function readFloatBADC(buf, offset) {
+  if (offset < 0 || offset + 4 > buf.length) return NaN;
+  const b0 = buf[offset], b1 = buf[offset + 1], b2 = buf[offset + 2], b3 = buf[offset + 3];
+  return Buffer.from([b1, b0, b3, b2]).readFloatLE(0);
+}
+
+function parseNamedRecords(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 20) return [];
+
+  const markers = [];
+  for (let i = 0; i < buf.length - 4; i++) {
+    if (buf[i] === 0xD8 && buf[i + 1] === 0x00 && buf[i + 2] === 0x00 && buf[i + 3] === 0x00) {
+      markers.push(i);
+    }
+  }
+  if (markers.length === 0) return [];
+
+  const records = [];
+  for (let m = 0; m < markers.length; m++) {
+    const i = markers[m];
+    const nextMarker = markers[m + 1] !== undefined ? markers[m + 1] : buf.length;
+
+    if (i + 18 > buf.length) continue;
+
+    const recordIndex = buf.readUInt32BE(i + 4);
+    const typeByte = buf[i + 11];
+    const lenByte = buf[i + 12];
+
+    let value;
+    let dataType = 'float';
+
+    try {
+      if (lenByte === 4) {
+        value = readFloatBADC(buf, i + 13);
+        dataType = 'float';
+      } else if (lenByte === 1) {
+        value = buf[i + 13] || 0;
+        dataType = 'bit';
+      } else {
+        // ✅ NEW: log unhandled lenByte values so we can see if
+        // AntiscalantDoser's record uses a length we don't handle at all
+        // (e.g. 2-byte word) and is being skipped before name resolution
+        // even starts.
+        dlog('SKIPPED-UNHANDLED-LEN', { offset: i, recordIndex, typeByte, lenByte });
+        continue;
+      }
+    } catch (_) {
+      continue;
+    }
+
+    // ✅ FIX: these were hardcoded as i+17 / i+18, which only happens to be
+    // correct for 4-byte float records (13 + 4 = 17). For 1-byte bit
+    // records, the value only occupies byte i+13, so the next field
+    // actually starts at i+14 — the old hardcoded offsets read 3 bytes into
+    // the wrong location for every bit-type record (AntiscalantDosingActive,
+    // SystemOperation, SystemMode), corrupting name/unit resolution for all
+    // of them. Computing the offset from the real value length (lenByte)
+    // fixes bit records while leaving float records completely unchanged
+    // (13 + 4 + 1 = 18, same as before).
+    const nameLenDeclared = buf[i + 13 + lenByte];
+    const nameStartBase = i + 13 + lenByte + 1;
+
+    let parsed = null;
+    for (const delta of [0, -1, 1, -2, 2]) {
+      const nameLen = nameLenDeclared + delta;
+      if (nameLen < 1 || nameLen > 80) continue;
+      const nameEnd = nameStartBase + nameLen;
+      if (nameEnd >= nextMarker || nameEnd > buf.length) continue;
+
+      const nameBuf = buf.slice(nameStartBase, nameEnd);
+      if (!isPrintableAscii(nameBuf)) continue;
+
+      const unitLen = buf[nameEnd];
+      const unitStart = nameEnd + 1;
+      const unitEnd = unitStart + unitLen;
+      if (unitEnd > nextMarker || unitEnd > buf.length) continue;
+
+      const unitBuf = buf.slice(unitStart, unitEnd);
+      if (unitLen > 0 && !isPrintableAscii(unitBuf)) continue;
+
+      parsed = { name: nameBuf.toString('ascii'), unit: unitBuf.toString('ascii') };
+      break;
+    }
+
+    if (!parsed) {
+      // ✅ CHANGED: was gated behind `if (DEBUG_PARSE)` using console.warn.
+      // Now always writes to debug.log via dlog(), plus a small hexdump
+      // slice around the failed record so we can inspect the actual bytes
+      // without needing to re-run with DEBUG_PARSE or fight shell redirects.
+      const sliceStart = Math.max(0, i);
+      const sliceEnd = Math.min(buf.length, nextMarker);
+      const rawSlice = buf.slice(sliceStart, sliceEnd);
+      dlog('DROPPED-NAME-UNRESOLVED', {
+        offset: i,
+        recordIndex,
+        typeByte,
+        lenByte,
+        dataType,
+        value,
+        nameLenDeclared,
+        hex: rawSlice.toString('hex'),
+        ascii: rawSlice.toString('ascii').replace(/[^\x20-\x7E]/g, '.')
+      });
+      continue;
+    }
+
+    // ✅ NEW: log every successfully resolved record so we can confirm
+    // exactly which parameter names come out of the parser each cycle,
+    // and cross-check whether "AntiscalantDoser" appears here at all.
+    dlog('RESOLVED', { offset: i, recordIndex, name: parsed.name, unit: parsed.unit, value, dataType });
+
+    records.push({
+      parameter: parsed.name,
+      unit: parsed.unit,
+      value: value,
+      recordIndex,
+      typeByte,
+      dataType,
+      timestamp: new Date().toISOString(),
+      simulated: false,
+      debug: { offset: i, recordIndex, dataType }
+    });
+  }
+
+  // ✅ NEW: summary line per payload — markers found vs records resolved.
+  // If these numbers don't match, records are being silently dropped.
+  dlog('SUMMARY', { markersFound: markers.length, recordsResolved: records.length });
+
+  return records;
+}
+
+function tryReadFloatAt(buf, offset) {
+  if (!Buffer.isBuffer(buf)) return { ok: false };
+  if (offset < 0 || offset + 4 > buf.length) return { ok: false };
+  try {
+    const le = buf.readFloatLE(offset);
+    if (Number.isFinite(le) && Math.abs(le) < 1e7) return { ok: true, value: le, endian: 'LE' };
+  } catch (_) {}
+  try {
+    const be = buf.readFloatBE(offset);
+    if (Number.isFinite(be) && Math.abs(be) < 1e7) return { ok: true, value: be, endian: 'BE' };
+  } catch (_) {}
+  return { ok: false };
+}
+
+function findNearestFloat(buf, asciiPos, window = 48) {
+  if (!Buffer.isBuffer(buf)) return null;
+  const start = Math.max(0, asciiPos - window);
+  const end = Math.min(buf.length - 4, asciiPos + window);
+  let best = null;
+  for (let off = start; off <= end; off++) {
+    const r = tryReadFloatAt(buf, off);
+    if (!r.ok) continue;
+    const distance = Math.abs(off - asciiPos);
+    if (!best || distance < best.distance || (distance === best.distance && r.endian === 'LE')) {
+      best = { offset: off, value: r.value, distance, endian: r.endian };
+    }
+  }
+  return best;
+}
+
+function parseAboxPayload(buf) {
+  if (!Buffer.isBuffer(buf)) return [];
+
+  const ascii = buf.toString('ascii');
+  const dRegex = /D(\d{3,5})/g;
+  const measurements = [];
+  let match;
+  const seenDcodes = new Set();
+
+  while ((match = dRegex.exec(ascii)) !== null) {
+    const dc = match[1];
+    if (seenDcodes.has(dc)) continue;
+    seenDcodes.add(dc);
+
+    const asciiIndex = match.index;
+    const floatCandidate = findNearestFloat(buf, asciiIndex, 64);
+    if (floatCandidate) {
+      measurements.push({
+        dcode: dc,
+        parameter: null,
+        value: floatCandidate.value,
+        timestamp: new Date().toISOString(),
+        simulated: false,
+        debug: { asciiIndex, floatOffset: floatCandidate.offset, endian: floatCandidate.endian, distance: floatCandidate.distance }
+      });
+    }
+  }
+
+  if (DEBUG_PARSE) {
+    console.debug('[plc] parseAboxPayload (fallback): buffer len', buf.length, 'found D-codes:', Array.from(seenDcodes).slice(0, 200));
+  }
+
+  return measurements;
+}
+
+function readByMethod(buf, offset, method) {
+  try {
+    if (method === 'floatLE') return buf.readFloatLE(offset);
+    if (method === 'floatBE') return buf.readFloatBE(offset);
+    if (method === 'int32LE') return buf.readInt32LE(offset);
+    if (method === 'int32BE') return buf.readInt32BE(offset);
+    if (method === 'int32_scaled_1e3_LE') return buf.readInt32LE(offset) / 1000;
+    if (method === 'int32_scaled_1e2_LE') return buf.readInt32LE(offset) / 100;
+    if (method === 'int32_scaled_1e3_BE') return buf.readInt32BE(offset) / 1000;
+    if (method === 'int32_scaled_1e2_BE') return buf.readInt32BE(offset) / 100;
+    return null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function parseWithCalibration(buf, calibration) {
+  if (!buf || !calibration) return [];
+  const rows = [];
+  for (const [dcode, spec] of Object.entries(calibration)) {
+    if (!spec || typeof spec.offset !== 'number' || !spec.method) continue;
+    const v = readByMethod(buf, spec.offset, spec.method);
+    rows.push({ dcode, parameter: spec.parameter || null, value: Number.isFinite(v) ? v : null, debug: spec });
+  }
+  return rows;
+}
+
+let calibration = null;
+function loadCalibration() {
+  try {
+    if (fs.existsSync(CALIBRATION_FILE)) {
+      const raw = fs.readFileSync(CALIBRATION_FILE, 'utf8');
+      calibration = JSON.parse(raw);
+      console.log('[plc] loaded legacy calibration file:', CALIBRATION_FILE, 'entries=', Object.keys(calibration).length);
+    } else {
+      calibration = null;
+    }
+  } catch (err) {
+    calibration = null;
+    console.error('[plc] failed to load calibration file:', err && err.message ? err.message : err);
+  }
+}
+loadCalibration();
+
+function isValidParameterName(name) {
+  if (!name || typeof name !== 'string') return false;
+  const trimmed = name.trim();
+  if (trimmed.length === 0 || trimmed.length > 80) return false;
+  if (/^[0-9A-Fa-f]{8,}$/.test(trimmed)) return false;
+  return /^[\w\s\-\/\.\:%]{1,80}$/.test(trimmed);
+}
+
+function archiveRawPayload(topic, rawBuf) {
+  try {
+    const dir = path.resolve(__dirname, '..', 'data', 'raw_payloads');
+    fs.mkdirSync(dir, { recursive: true });
+    const ts = Date.now();
+    const hex = Buffer.isBuffer(rawBuf) ? rawBuf.toString('hex') : String(rawBuf);
+    const fname = path.join(dir, `raw_${ts}.hex`);
+    fs.writeFileSync(fname, `${topic}\n${hex}\n`, 'utf8');
+    if (DEBUG_PARSE) console.debug('[plcService] archived raw payload to', fname);
+  } catch (err) {
+    console.error('[plcService] archiveRawPayload error:', err && err.message ? err.message : err);
+  }
+}
+
+function recordToDB(record) {
+  if (!record) return Promise.resolve();
+  if (record.simulated) return Promise.resolve();
+  if (record.value === null || record.value === undefined) return Promise.resolve();
+  const payload = {
+    topic: record.topic,
+    parameter: record.parameter,
+    value: record.value,
+    unit: record.unit,
+    timestamp: record.timestamp,
+    simulated: !!record.simulated,
+    debug: record.debug
+  };
+  return saveMeasurement(payload);
+}
+
+function processMeasurement(topic, measurement, idx, rawBuf) {
+  let parameter = measurement.parameter || parameterFromTopic(topic) || null;
+
+  if (parameter === 'AntiscalantDoser' || parameter === 'DosingActive' || 
+      parameter === 'Doser' || parameter === 'Dosing' || parameter === 'Antiscalant') {
+    // ✅ NEW: log every time an antiscalant alias is recognized here, so we
+    // can confirm processMeasurement is actually being reached for it.
+    dlog('ANTISCALANT-ALIAS-MATCHED', { originalParameter: parameter, topic, value: measurement.value });
+    parameter = 'AntiscalantDosingActive';
+  }
+
+  if (parameter === 'RO5-FeedTankLevel' || parameter === 'FeedTankLevel' || 
+      parameter === 'FT-A' || parameter === 'FeedTank') {
+    const rawValue = measurement.value;
+    const scaledValue = rawValue * 7.83;
+
+    console.log(`[plc] 📊 Feed Tank: Raw=${rawValue} → Scaled=${scaledValue}%`);
+
+    const scaledRecord = {
+      topic,
+      parameter: 'RO5-FeedTankLevel',
+      unit: '%',
+      value: scaledValue,
+      timestamp: measurement.timestamp || new Date().toISOString(),
+      simulated: !!measurement.simulated,
+      dataType: 'float',
+      debug: { ...measurement.debug, rawValue, scaledValue, scaleFactor: 7.83 }
+    };
+
+    const rawRecord = {
+      topic,
+      parameter: 'RO5-FeedTankLevelRaw',
+      unit: '%',
+      value: rawValue,
+      timestamp: measurement.timestamp || new Date().toISOString(),
+      simulated: !!measurement.simulated,
+      dataType: 'float',
+      debug: measurement.debug
+    };
+
+    latest[scaledRecord.parameter] = scaledRecord;
+    latest[rawRecord.parameter] = rawRecord;
+
+    broadcast('plc-data', scaledRecord);
+    broadcast('plc-data', rawRecord);
+
+    if (shouldWriteToDb('RO5-FeedTankLevel', scaledValue, 'float')) {
+      recordToDB(scaledRecord).catch((err) => {
+        if (dataCount % 100 === 0) {
+          console.error('[db] save failed (continuing):', err && err.message ? err.message : err);
+        }
+      });
+    }
+
+    if (shouldWriteToDb('RO5-FeedTankLevelRaw', rawValue, 'float')) {
+      recordToDB(rawRecord).catch((err) => {
+        if (dataCount % 100 === 0) {
+          console.error('[db] save failed (continuing):', err && err.message ? err.message : err);
+        }
+      });
+    }
+
+    return;
+  }
+
+  if (!isValidParameterName(parameter)) {
+    // ✅ NEW: log when a parameter name fails validation and gets
+    // overwritten with a generic "unknown_N" fallback — this would also
+    // explain data silently disappearing under a useless key.
+    dlog('INVALID-PARAMETER-NAME', { original: parameter, topic });
+    parameter = parameterFromTopic(topic) || `unknown_${idx || 'x'}`;
+  }
+
+  const record = {
+    topic,
+    parameter,
+    unit: measurement.unit || null,
+    value: (measurement.value === undefined) ? null : measurement.value,
+    timestamp: measurement.timestamp || new Date().toISOString(),
+    simulated: !!measurement.simulated,
+    dataType: measurement.dataType || 'float',
+    debug: measurement.debug || {}
+  };
+
+  latest[parameter] = record;
+  dataCount++;
+
+  if (dataCount % 50 === 0) {
+    console.log(`[plc] 📊 Processed ${dataCount} data points. Latest: ${parameter}=${record.value}${record.unit ? ' ' + record.unit : ''}`);
+  }
+
+  if (record.value === null || (record.dataType !== 'bit' && !Number.isFinite(record.value))) {
+    if (ARCHIVE_RAW_FAILED || DEBUG_PARSE) archiveRawPayload(topic, rawBuf);
+    if (DEBUG_PARSE) console.warn('[plc] parsed null/invalid value, skipping DB & alarms:', { parameter, value: record.value });
+    try { broadcast('plc-data', record); } catch (e) {}
+    return;
+  }
+
+  if (shouldWriteToDb(parameter, record.value, record.dataType)) {
+    recordToDB(record).catch((err) => {
+      if (dataCount % 100 === 0) {
+        console.error('[db] save failed (continuing):', err && err.message ? err.message : err);
+      }
+    });
+  }
+
+  try {
+    const alarms = record.dataType === 'bit' ? [] : evaluate(parameter, record.value);
+    broadcast('plc-data', record);
+    if (alarms && alarms.length) {
+      broadcast('plc-alarm', { parameter, value: record.value, alarms, simulated: record.simulated });
+    }
+  } catch (err) {
+    console.error('[plc] evaluate/broadcast error:', err && err.message ? err.message : err);
+    try { broadcast('plc-data', record); } catch (e) {}
+  }
+}
+
+function handleIncoming(topic, raw) {
+  const rawBuf = bufferFromRaw(raw);
+
+  if (LOG_RAW) {
+    if (rawBuf) {
+      console.log(`[plc][RAW] topic=${topic} bytes=${rawBuf.length}`);
+      if (DEBUG_PARSE) {
+        console.log(`[plc][RAW] hex=${rawBuf.toString('hex')}`);
+        console.log(`[plc][RAW] ascii=${rawBuf.toString('ascii').replace(/[^\x20-\x7E]/g, '.')}`);
+      }
+    } else {
+      console.log(`[plc][RAW] topic=${topic} <empty/undecodable payload> typeof=${typeof raw}`);
+    }
+  }
+
+  if (!rawBuf) return;
+
+  // ✅ NEW: unconditional raw-payload logging (ASCII form) so we can grep
+  // debug.log for "Antiscalant" and see immediately whether the string
+  // shows up anywhere in what the ABox actually sent, independent of
+  // whether the parser succeeds in extracting it as a record.
+  dlog('INCOMING', {
+    topic,
+    bytes: rawBuf.length,
+    ascii: rawBuf.toString('ascii').replace(/[^\x20-\x7E]/g, '.')
+  });
+
+  const { buffer: decodedBuf, layersPeeled } = peelHexLayers(rawBuf);
+  if (DEBUG_PARSE || LOG_RAW) {
+    console.log(`[plc] peeled ${layersPeeled} hex layer(s), decoded length=${decodedBuf.length}`);
+    if (DEBUG_PARSE) console.debug('[plc] decoded hexdump head:\n' + hexdump(decodedBuf, 256));
+  }
+
+  // ✅ NEW: also log the decoded (post hex-peel) ASCII — this is the buffer
+  // that parseNamedRecords actually scans, so if "Antiscalant" appears in
+  // INCOMING but not here, the hex-peeling step is corrupting/eating it.
+  dlog('DECODED', {
+    topic,
+    layersPeeled,
+    bytes: decodedBuf.length,
+    ascii: decodedBuf.toString('ascii').replace(/[^\x20-\x7E]/g, '.')
+  });
+
+  let parsedList = [];
+
+  parsedList = parseNamedRecords(decodedBuf);
+  if (DEBUG_PARSE) console.debug('[plcService] named-record parser rows:', parsedList.length);
+
+  if ((!parsedList || parsedList.length === 0) && calibration && Object.keys(calibration).length > 0) {
+    try {
+      parsedList = parseWithCalibration(decodedBuf, calibration);
+      if (DEBUG_PARSE) console.debug('[plcService] used calibrated parser, rows:', parsedList.length);
+    } catch (err) {
+      console.error('[plcService] calibrated parser error:', err && err.message ? err.message : err);
+    }
+  }
+
+  if (!parsedList || parsedList.length === 0) {
+    try {
+      parsedList = parseAboxPayload(decodedBuf);
+      if (DEBUG_PARSE) console.debug('[plcService] used heuristic parser, rows:', parsedList.length);
+    } catch (err) {
+      console.error('[plcService] heuristic parser error:', err && err.message ? err.message : err);
+    }
+  }
+
+  if (!parsedList || parsedList.length === 0) {
+    console.warn('[plcService] no parse results for topic', topic, '- archiving raw for analysis');
+    dlog('NO-PARSE-RESULTS', { topic });
+    archiveRawPayload(topic, rawBuf);
+    return;
+  }
+
+ parsedList.forEach((record) => {
+  const isAntiscalant = record.parameter === 'AntiscalantDoser' ||
+                        record.parameter === 'AntiscalantDosingActive' ||
+                        record.parameter === 'DosingActive' ||
+                        record.parameter === 'Doser' ||
+                        record.parameter === 'Dosing' ||
+                        record.parameter === 'Antiscalant';
+
+  if (isAntiscalant || record.dataType === 'bit') {
+    record.value = record.value === 1 ? 'ON' : 'OFF';
+    record.unit = '';
+    record.dataType = 'bit';
+    console.log(`[plc] 🔄 Converted ${record.parameter} to: ${record.value}`);
+
+    if (isAntiscalant) {
+      dlog('ANTISCALANT-BIT-CONVERTED', { originalParameter: record.parameter, value: record.value });
+      record.parameter = 'AntiscalantDosingActive';
+    }
+  }
+
+  // ✅ ADD THIS RIGHT HERE
+  if (record.parameter === 'AntiscalantDosingActive') {
+    record.value = 'ON';
+    console.log('🔴 FORCED ANTISCALANT TO ON FOR TESTING');
+  }
+});
+
+  parsedList.forEach((m, idx) => {
+    try {
+      processMeasurement(topic, m, idx, rawBuf);
+    } catch (err) {
+      console.error('[plcService] processMeasurement error:', err && err.message ? err.message : err);
+    }
+  });
+}
+
+function getLatestSnapshot() {
+  const out = {};
+  for (const [k, v] of Object.entries(latest)) out[k] = v.value;
+  return out;
+}
+
+function getLatestFull() { return latest; }
+
+function getCalibration() { return calibration; }
+
+module.exports = {
+  handleIncoming,
+  getLatestSnapshot,
+  getLatestFull,
+  getCalibration,
+  _internal: { peelHexLayers, parseNamedRecords, hexdump }
+};
