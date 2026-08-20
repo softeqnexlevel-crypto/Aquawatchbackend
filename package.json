@@ -15,10 +15,7 @@
     "db:seed": "node scripts/seed.js"
   },
   "dependencies": {
-<<<<<<< HEAD
     "@google/generative-ai": "^0.24.1",
-=======
->>>>>>> 13fc14314d7a2e189775b38a074b46d2541c8462
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
