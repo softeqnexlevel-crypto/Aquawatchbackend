@@ -2,10 +2,6 @@
 const express = require('express');
 const router = express.Router();
 const authService = require('../services/auth.service');
-<<<<<<< HEAD
-const billingService = require('../services/billing.service');
-=======
->>>>>>> 13fc14314d7a2e189775b38a074b46d2541c8462
 const authMiddleware = require('../middleware/auth.middleware');
 const rolesMiddleware = require('../middleware/roles.middleware');
 
@@ -46,27 +42,11 @@ router.post('/refresh', async (req, res) => {
 // ==================== PROTECTED ROUTES ====================
 
 // Get current user
-<<<<<<< HEAD
-// ✅ Now also attaches subscriptionStatus + daysRemaining (or
-// currentPeriodEnd for paying users) so AuthContext.jsx has everything
-// it needs in the one call it already makes on load, instead of a
-// second round-trip to a separate billing endpoint.
-router.get('/me', authMiddleware.requireAuth, async (req, res) => {
-    try {
-        const subscription = await billingService.getSubscriptionStatus(req.user.id, req.user.createdAt);
-        res.json({ user: { ...req.user, ...subscription } });
-    } catch (error) {
-        console.error('[auth] /me subscription lookup failed:', error);
-        // Fail open on the subscription lookup specifically — don't let a
-        // billing hiccup lock a paying user out of a page load entirely.
-        res.json({ user: req.user });
-=======
 router.get('/me', authMiddleware.requireAuth, async (req, res) => {
     try {
         res.json({ user: req.user });
     } catch (error) {
         res.status(500).json({ error: 'Failed to get user' });
->>>>>>> 13fc14314d7a2e189775b38a074b46d2541c8462
     }
 });
 
