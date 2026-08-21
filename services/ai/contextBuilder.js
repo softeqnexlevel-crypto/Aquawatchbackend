@@ -1,21 +1,7 @@
-// services/ai/contextBuilder.js
-//
-// Builds the compact, structured "current system context" block sent to
-// the AI on every chat request. Per spec Section 25 ("do not send huge
-// raw datasets to the LLM") this pulls only the latest values + a small
-// set of derived status fields — never raw historical telemetry.
-//
-// Also holds the fixed SYSTEM_PROMPT enforcing spec Section 24's rules
-// (no invented data, observed vs. interpretation, read-only, etc.).
-//
-// NOTE: adjust the require path below to match wherever your PLC
-// snapshot service actually lives (this assumes backend/services/plcService.js,
-// one level up from backend/services/ai/contextBuilder.js).
+
 const { getLatestSnapshot } = require('../plcParser');
 
-// Same ON/OFF-aware normalization used across the frontend
-// (Dashboard.jsx, alertEngine.js) — bit-type values arrive as 'ON'/'OFF'
-// strings, not booleans or numbers.
+
 function isActive(value) {
   if (value === undefined || value === null) return false;
   if (typeof value === 'boolean') return value;
@@ -95,7 +81,13 @@ Rules you must always follow:
 - If the context does not contain the information needed to answer a question, say so plainly rather than guessing.
 - Do not diagnose equipment failures without sufficient evidence — suggest what should be investigated instead of asserting a root cause.
 - You are strictly read-only: you cannot and must not suggest you are controlling equipment, changing settings, or modifying configuration. You may only observe and explain.
-- Keep responses concise and practical — this is for a plant operator who needs a clear, actionable answer, not a lengthy report (unless they explicitly ask for a full report).
-- If asked something outside the scope of the Aqua system (general chit-chat, unrelated topics), politely redirect to what you can help with.`;
+- If asked something outside the scope of the Aqua system (general chit-chat, unrelated topics), politely redirect to what you can help with.
+
+Response style:
+- Default to short, direct answers — a few sentences or a short bullet list. Most questions ("how is it doing", "any alarms", "what's the recovery") deserve a quick, scannable answer, not a full report.
+- Only use longer structured sections (Summary / Key Findings / Trend / Possible Causes / Recommended Checks) when the operator explicitly asks for analysis, a report, or an explanation of "why" something happened.
+- Never restate the same point twice in different words. Say each fact once.
+- Use markdown formatting (bold, bullet lists) to make responses scannable, but keep it lightweight — don't over-structure a one-line answer.
+- If the system is off or a value is null/missing, say that plainly in one line rather than walking through every field that's unavailable.`;
 
 module.exports = { buildSystemContext, SYSTEM_PROMPT, isActive, toNumber };
