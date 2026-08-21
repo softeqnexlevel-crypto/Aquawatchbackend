@@ -26,18 +26,27 @@ async function initDb() {
         }
 
         // Production-optimized pool
-        pool = new Pool({
-            connectionString,
-            max: parseInt(process.env.DB_POOL_MAX) || 10,
-            min: parseInt(process.env.DB_POOL_MIN) || 2,
-            idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT) || 30000,
-            connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 5000,
-            statement_timeout: 30000,
-            query_timeout: 30000,
-           ssl: process.env.DB_SSL === 'true'
-    ? { rejectUnauthorized: false }
-    : false,
-        });
+    //     pool = new Pool({
+    //         connectionString,
+    //         max: parseInt(process.env.DB_POOL_MAX) || 10,
+    //         min: parseInt(process.env.DB_POOL_MIN) || 2,
+    //         idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT) || 30000,
+    //         connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 5000,
+    //         statement_timeout: 30000,
+    //         query_timeout: 30000,
+    //        ssl: process.env.DB_SSL === 'true'
+    // ? { rejectUnauthorized: false }
+    // : false,
+    //     });
+    pool = new Pool({
+    connectionString,
+    max: parseInt(process.env.DB_POOL_MAX) || 10,
+    min: parseInt(process.env.DB_POOL_MIN) || 2,
+    idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT) || 30000,
+    connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 5000,
+    statement_timeout: 30000,
+    query_timeout: 30000,
+});
 
         // Test connection
         await pool.query('SELECT 1');

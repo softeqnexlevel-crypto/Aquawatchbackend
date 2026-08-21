@@ -15,6 +15,7 @@
     "db:seed": "node scripts/seed.js"
   },
   "dependencies": {
+    "@google/genai": "^2.18.0",
     "@google/generative-ai": "^0.24.1",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
