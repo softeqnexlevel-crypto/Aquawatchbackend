@@ -337,7 +337,23 @@ async function getMeasurementAggregates(parameter, bucket = '1 hour', hours = 24
 }
 
 
-async function getProductionVolume(parameter, sinceHoursAgo) {
+// ============================================================
+// REPOSITORY: MEASUREMENTS — PRODUCTION VOLUME
+// ============================================================
+//
+// Integrates value (m3/hr) over time using the trapezoidal rule to get
+// total volume (m3) between startTime and endTime.
+//
+// IMPORTANT: LAG() is computed over ALL rows up to endTime, BEFORE we
+// filter into the sum. If we filtered rows into the window first (as the
+// old rolling-window version did), the first row inside the window would
+// have prev_time = NULL and its lead-in interval would be silently
+// dropped, undercounting every period. Instead we compute prev_time/
+// prev_value on the unfiltered series, then only sum intervals that
+// overlap [startTime, endTime], clipping the boundary-crossing interval
+// with GREATEST(prev_time, startTime) so partial coverage is counted
+// correctly instead of discarded.
+async function getProductionVolume(parameter, startTime, endTime = new Date()) {
     const db = getDb();
     const result = await db.execute(sql`
         WITH ordered AS (
@@ -348,29 +364,56 @@ async function getProductionVolume(parameter, sinceHoursAgo) {
                 LAG(value) OVER (ORDER BY time) AS prev_value
             FROM measurements
             WHERE parameter = ${parameter}
-                AND time > NOW() - INTERVAL '1 hour' * ${sinceHoursAgo}
-            ORDER BY time
+                AND time <= ${endTime}
+        ),
+        production_intervals AS (
+            SELECT
+                GREATEST(prev_time, ${startTime}) AS interval_start,
+                time AS interval_end,
+                value,
+                prev_value
+            FROM ordered
+            WHERE prev_time IS NOT NULL
+                AND time > ${startTime}
+                AND time <= ${endTime}
         )
-        SELECT COALESCE(SUM(
-            CASE
-                WHEN prev_time IS NOT NULL THEN
-                    ((value + prev_value) / 2.0) * (EXTRACT(EPOCH FROM (time - prev_time)) / 3600.0)
-                ELSE 0
-            END
-        ), 0) AS total_volume
-        FROM ordered;
+        SELECT COALESCE(
+            SUM(
+                ((value + prev_value) / 2.0)
+                * (EXTRACT(EPOCH FROM (interval_end - interval_start)) / 3600.0)
+            ),
+            0
+        ) AS total_volume
+        FROM production_intervals;
     `);
     const row = result.rows ? result.rows[0] : result[0];
     return Number(row?.total_volume) || 0;
 }
 
+// Calendar-aligned periods: today since midnight, this week since Monday,
+// this month since the 1st, this year since Jan 1 — not rolling windows.
 async function getProductionSummary(parameter = 'RO5-Permeateflow') {
+    const now = new Date();
+
+    const startOfToday = new Date(now);
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const startOfWeek = new Date(now);
+    const day = startOfWeek.getDay(); // Sunday = 0
+    const daysSinceMonday = day === 0 ? 6 : day - 1;
+    startOfWeek.setDate(startOfWeek.getDate() - daysSinceMonday);
+    startOfWeek.setHours(0, 0, 0, 0);
+
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+    const startOfYear = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
+
     const [daily, weekly, monthly, yearly] = await Promise.all([
-        getProductionVolume(parameter, 24),
-        getProductionVolume(parameter, 24 * 7),
-        getProductionVolume(parameter, 24 * 30),
-        getProductionVolume(parameter, 24 * 365),
+        getProductionVolume(parameter, startOfToday, now),
+        getProductionVolume(parameter, startOfWeek, now),
+        getProductionVolume(parameter, startOfMonth, now),
+        getProductionVolume(parameter, startOfYear, now),
     ]);
+
     return { daily, weekly, monthly, yearly };
 }
 
