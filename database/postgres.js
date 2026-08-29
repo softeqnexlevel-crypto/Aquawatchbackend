@@ -25,28 +25,15 @@ async function initDb() {
             throw new Error('DATABASE_URL environment variable is not set');
         }
 
-        // Production-optimized pool
-    //     pool = new Pool({
-    //         connectionString,
-    //         max: parseInt(process.env.DB_POOL_MAX) || 10,
-    //         min: parseInt(process.env.DB_POOL_MIN) || 2,
-    //         idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT) || 30000,
-    //         connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 5000,
-    //         statement_timeout: 30000,
-    //         query_timeout: 30000,
-    //        ssl: process.env.DB_SSL === 'true'
-    // ? { rejectUnauthorized: false }
-    // : false,
-    //     });
-    pool = new Pool({
-    connectionString,
-    max: parseInt(process.env.DB_POOL_MAX) || 10,
-    min: parseInt(process.env.DB_POOL_MIN) || 2,
-    idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT) || 30000,
-    connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 5000,
-    statement_timeout: 30000,
-    query_timeout: 30000,
-});
+        pool = new Pool({
+            connectionString,
+            max: parseInt(process.env.DB_POOL_MAX) || 10,
+            min: parseInt(process.env.DB_POOL_MIN) || 2,
+            idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT) || 30000,
+            connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 5000,
+            statement_timeout: 30000,
+            query_timeout: 30000,
+        });
 
         // Test connection
         await pool.query('SELECT 1');
@@ -61,7 +48,7 @@ async function initDb() {
             console.log('[DB] New connection established');
         });
 
-        db = drizzle(pool, { 
+        db = drizzle(pool, {
             schema,
             logger: process.env.NODE_ENV !== 'production'
         });
@@ -171,8 +158,8 @@ async function createUser(data) {
 async function updateUser(id, data) {
     const db = getDb();
     const result = await db.update(schema.users)
-        .set({ 
-            ...data, 
+        .set({
+            ...data,
             updatedAt: new Date(),
             ...(data.passwordHash ? { passwordHash: data.passwordHash } : {})
         })
@@ -201,11 +188,11 @@ async function getAllUsers(organizationId = null) {
         .from(schema.users)
         .where(sql`${schema.users.deletedAt} IS NULL`)
         .orderBy(schema.users.createdAt, 'desc');
-    
+
     if (organizationId) {
         query = query.where(sql`${schema.users.organizationId} = ${organizationId}`);
     }
-    
+
     return query;
 }
 
@@ -321,7 +308,7 @@ async function getMeasurementHistory(parameter, hours = 24, limit = 1000) {
 async function getMeasurementAggregates(parameter, bucket = '1 hour', hours = 24) {
     const db = getDb();
     return db.execute(sql`
-        SELECT 
+        SELECT
             time_bucket(${bucket}, time) AS bucket,
             AVG(value) AS avg_value,
             MIN(value) AS min_value,
@@ -345,9 +332,9 @@ async function getMeasurementAggregates(parameter, bucket = '1 hour', hours = 24
 // total volume (m3) between startTime and endTime.
 //
 // IMPORTANT: LAG() is computed over ALL rows up to endTime, BEFORE we
-// filter into the sum. If we filtered rows into the window first (as the
-// old rolling-window version did), the first row inside the window would
-// have prev_time = NULL and its lead-in interval would be silently
+// filter into the sum. If we filtered rows into the window first (as an
+// earlier rolling-window version did), the first row inside the window
+// would have prev_time = NULL and its lead-in interval would be silently
 // dropped, undercounting every period. Instead we compute prev_time/
 // prev_value on the unfiltered series, then only sum intervals that
 // overlap [startTime, endTime], clipping the boundary-crossing interval
@@ -390,36 +377,71 @@ async function getProductionVolume(parameter, startTime, endTime = new Date()) {
     return Number(row?.total_volume) || 0;
 }
 
+// ------------------------------------------------------------
+// Plant-local calendar boundaries (Africa/Nairobi, fixed UTC+3, no DST)
+// ------------------------------------------------------------
+//
+// FIXED: the previous version computed "today"/"this week"/etc. using
+// `new Date(now); date.setHours(0,0,0,0)`. setHours() resets the clock in
+// the SERVER's local timezone, not the plant's. If the server process runs
+// with TZ=UTC (the default on most hosts/containers), "midnight" for that
+// code was actually 03:00 EAT — so right after real local midnight in
+// Nairobi, "Today" kept summing from the *previous* day's 00:00 EAT boundary
+// (effectively still counting most of yesterday) until the server's own
+// clock rolled over three hours later. That's why the dashboard showed a
+// large "Today" total moments after visually crossing into a new day.
+//
+// The fix below computes the boundary using the plant's fixed UTC+3 offset
+// directly, regardless of what timezone the Node process itself is running
+// in, so "Today" always starts at true 00:00 Africa/Nairobi time.
+const PLANT_UTC_OFFSET_MS = 3 * 60 * 60 * 1000; // Africa/Nairobi = UTC+3, no DST
+
+// Shifts a real UTC instant so its UTC getters (getUTCFullYear, getUTCDate,
+// getUTCDay, etc.) read back as Nairobi wall-clock values.
+function toPlantWallClock(utcDate) {
+    return new Date(utcDate.getTime() + PLANT_UTC_OFFSET_MS);
+}
+
+// Converts a "wall clock" Date (built with Date.UTC using plant-local
+// year/month/day) back into the real UTC instant it represents.
+function fromPlantWallClock(wallClockDate) {
+    return new Date(wallClockDate.getTime() - PLANT_UTC_OFFSET_MS);
+}
+
 // Calendar-aligned periods: today since midnight, this week since Monday,
-// this month since the 1st, this year since Jan 1 — not rolling windows.
+// this month since the 1st, this year since Jan 1 — all anchored to
+// Africa/Nairobi local time, not rolling windows and not server-local time.
 async function getProductionSummary(parameter = 'RO5-Permeateflow') {
-    const now = new Date();
+    const nowUTC = new Date();
+    const wall = toPlantWallClock(nowUTC);
 
-    const startOfToday = new Date(now);
-    startOfToday.setHours(0, 0, 0, 0);
+    const startOfToday = fromPlantWallClock(
+        new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate()))
+    );
 
-    const startOfWeek = new Date(now);
-    const day = startOfWeek.getDay(); // Sunday = 0
-    const daysSinceMonday = day === 0 ? 6 : day - 1;
-    startOfWeek.setDate(startOfWeek.getDate() - daysSinceMonday);
-    startOfWeek.setHours(0, 0, 0, 0);
+    const dow = wall.getUTCDay(); // Sunday = 0, evaluated in plant-local terms
+    const daysSinceMonday = dow === 0 ? 6 : dow - 1;
+    const startOfWeek = fromPlantWallClock(
+        new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate() - daysSinceMonday))
+    );
 
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
-    const startOfYear = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
+    const startOfMonth = fromPlantWallClock(
+        new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), 1))
+    );
+
+    const startOfYear = fromPlantWallClock(
+        new Date(Date.UTC(wall.getUTCFullYear(), 0, 1))
+    );
 
     const [daily, weekly, monthly, yearly] = await Promise.all([
-        getProductionVolume(parameter, startOfToday, now),
-        getProductionVolume(parameter, startOfWeek, now),
-        getProductionVolume(parameter, startOfMonth, now),
-        getProductionVolume(parameter, startOfYear, now),
+        getProductionVolume(parameter, startOfToday, nowUTC),
+        getProductionVolume(parameter, startOfWeek, nowUTC),
+        getProductionVolume(parameter, startOfMonth, nowUTC),
+        getProductionVolume(parameter, startOfYear, nowUTC),
     ]);
 
     return { daily, weekly, monthly, yearly };
 }
-
-// Remember to add these two functions to the module.exports block:
-//   getProductionVolume,
-//   getProductionSummary,
 
 // ============================================================
 // REPOSITORY: ALERTS
@@ -446,11 +468,11 @@ async function getActiveAlerts(organizationId = null) {
         .from(schema.alerts)
         .where(sql`${schema.alerts.resolved} = false`)
         .orderBy(schema.alerts.createdAt, 'desc');
-    
+
     if (organizationId) {
         query = query.where(sql`${schema.alerts.organizationId} = ${organizationId}`);
     }
-    
+
     return query;
 }
 
@@ -519,11 +541,11 @@ async function getAllDevices(organizationId = null) {
         .from(schema.devices)
         .where(sql`${schema.devices.isActive} = true`)
         .orderBy(schema.devices.name);
-    
+
     if (organizationId) {
         query = query.where(sql`${schema.devices.organizationId} = ${organizationId}`);
     }
-    
+
     return query;
 }
 
@@ -583,11 +605,11 @@ async function getAuditLogs(organizationId = null, limit = 100) {
         .from(schema.auditLogs)
         .orderBy(schema.auditLogs.createdAt, 'desc')
         .limit(limit);
-    
+
     if (organizationId) {
         query = query.where(sql`${schema.auditLogs.organizationId} = ${organizationId}`);
     }
-    
+
     return query;
 }
 
@@ -620,11 +642,11 @@ async function getActiveAlertRules(organizationId = null) {
     let query = db.select()
         .from(schema.alertRules)
         .where(sql`${schema.alertRules.isActive} = true`);
-    
+
     if (organizationId) {
         query = query.where(sql`${schema.alertRules.organizationId} = ${organizationId}`);
     }
-    
+
     return query;
 }
 
@@ -640,7 +662,7 @@ const DEFAULT_SETTINGS = {
   minDosing: 2.0,
   maxDosing: 3.0,
 };
- 
+
 
 
 async function getSettings() {
@@ -649,12 +671,12 @@ async function getSettings() {
         .from(schema.systemSettings)
         .where(sql`${schema.systemSettings.id} = 1`)
         .limit(1);
- 
+
     // First run — no row yet. Return sane defaults without writing anything,
     // so a plain GET never has side effects.
     return result[0] || { id: 1, ...DEFAULT_SETTINGS, updatedAt: null, updatedBy: null };
 }
- 
+
 async function saveSettings(data, userId) {
     const db = getDb();
     const values = {
@@ -672,7 +694,7 @@ async function saveSettings(data, userId) {
         updatedAt: new Date(),
         updatedBy: userId || null,
     };
- 
+
     const result = await db.insert(schema.systemSettings)
         .values(values)
         .onConflictDoUpdate({
@@ -680,7 +702,7 @@ async function saveSettings(data, userId) {
             set: values,
         })
         .returning();
- 
+
     return result[0];
 }
 
@@ -783,7 +805,7 @@ module.exports = {
     getPool,
     generateUUID,
     healthCheck,
-    
+
     // Users
     findUserByEmail,
     findUserById,
@@ -791,13 +813,13 @@ module.exports = {
     updateUser,
     deleteUser,
     getAllUsers,
-    
+
     // Refresh Tokens
     saveRefreshToken,
     findRefreshTokenByHash,
     revokeRefreshToken,
     revokeAllUserRefreshTokens,
-    
+
     // Measurements
     saveMeasurement,
     saveBatchMeasurements,
@@ -806,31 +828,31 @@ module.exports = {
     getMeasurementAggregates,
     getProductionVolume,
     getProductionSummary,
-    
+
     // Alerts
     createAlert,
     getActiveAlerts,
     acknowledgeAlert,
     resolveAlert,
-    
+
     // Devices
     createDevice,
     getDevice,
     getAllDevices,
-    
+
     // Tags
     createTag,
     getTagsByDevice,
-    
+
     // Alert Rules
     createAlertRule,
     getActiveAlertRules,
-    
+
     // Audit
     logAction,
     getAuditLogs,
 
-    // setting
+    // Settings
     getSettings,
     saveSettings,
 
@@ -843,7 +865,7 @@ module.exports = {
     upsertActiveSubscription,
     updateSubscriptionByCustomerCode,
     updateSubscriptionByCode,
-    
+
     // Schema
     schema,
 };
