@@ -1,4 +1,6 @@
 // backend/routes/billing.routes.js
+'use strict';
+
 const express = require('express');
 const router = express.Router();
 const billingService = require('../services/billing.service');
@@ -6,12 +8,12 @@ const authMiddleware = require('../middleware/auth.middleware');
 
 // ==================== PUBLIC ====================
 
-// Plan list is public — pricing pages don't require login to view.
 router.get('/plans', async (req, res) => {
     try {
         const plans = await billingService.getPlans();
         res.json(plans);
     } catch (error) {
+        console.error('[billing] GET /plans error:', error.message);
         res.status(500).json({ error: 'Failed to load plans' });
     }
 });
@@ -23,54 +25,55 @@ router.get('/history', authMiddleware.requireAuth, async (req, res) => {
         const history = await billingService.getHistory(req.user.id);
         res.json(history);
     } catch (error) {
+        console.error('[billing] GET /history error:', error.message);
         res.status(500).json({ error: 'Failed to load billing history' });
     }
 });
 
-router.post('/subscribe/initialize', authMiddleware.requireAuth, async (req, res) => {
+router.post('/subscribe/mpesa/initialize', authMiddleware.requireAuth, async (req, res) => {
     try {
-        const { planCode, email } = req.body;
-        if (!planCode || !email) {
-            return res.status(400).json({ error: 'planCode and email are required' });
+        const { phone } = req.body;
+        if (!phone) {
+            return res.status(400).json({ error: 'phone is required' });
         }
-        const result = await billingService.initializeCheckout({
-            userId: req.user.id,
-            email,
-            planCode,
-        });
+        const result = await billingService.initiateStkPush({ userId: req.user.id, phone });
         res.json(result);
     } catch (error) {
+        console.error('[billing] POST /subscribe/mpesa/initialize error:', error.message);
         res.status(400).json({ error: error.message });
     }
 });
 
-// ==================== WEBHOOK ====================
-//
-// req.body arrives here as a raw Buffer already — server.js carves out
-// this exact path BEFORE its global express.json() middleware runs, so
-// Paystack's signature (computed over the raw bytes) can be verified
-// correctly. Do NOT add express.json() or express.raw() here again —
-// the request stream has already been consumed once; parsing it a
-// second time would silently produce an empty body and break
-// verification. See the PAYSTACK_WEBHOOK_PATH carve-out in server.js.
-router.post('/webhook', async (req, res) => {
+router.get('/subscribe/mpesa/status/:checkoutRequestId', authMiddleware.requireAuth, async (req, res) => {
     try {
-        const signature = req.headers['x-paystack-signature'];
-        const rawBody = req.body; // Buffer, thanks to express.raw() above
-
-        if (!billingService.verifyWebhookSignature(rawBody, signature)) {
-            console.warn('[billing] Webhook signature verification failed');
-            return res.status(401).send('Invalid signature');
-        }
-
-        const event = JSON.parse(rawBody.toString('utf8'));
-        await billingService.handleWebhookEvent(event);
-
-        res.sendStatus(200); // Paystack just needs a 200 to stop retrying
+        const result = await billingService.checkStkStatus(req.params.checkoutRequestId);
+        res.json(result);
     } catch (error) {
-        console.error('[billing] Webhook processing error:', error);
-        res.sendStatus(500);
+        console.error('[billing] GET /subscribe/mpesa/status error:', error.message);
+        res.status(400).json({ error: error.message });
     }
+});
+
+// ==================== CALLBACK ====================
+// Public — Safaricom calls this directly.
+
+const MPESA_CALLBACK_TOKEN = process.env.MPESA_CALLBACK_TOKEN;
+const MPESA_ALLOWED_IPS = (process.env.MPESA_ALLOWED_IPS || '').split(',').filter(Boolean);
+
+router.post('/webhook/mpesa/:token', async (req, res) => {
+    if (!MPESA_CALLBACK_TOKEN || req.params.token !== MPESA_CALLBACK_TOKEN) {
+        console.warn('[billing] rejected M-Pesa callback: bad token');
+        return res.status(404).end();
+    }
+    if (MPESA_ALLOWED_IPS.length && !MPESA_ALLOWED_IPS.includes(req.ip)) {
+        console.warn('[billing] rejected M-Pesa callback from', req.ip);
+        return res.status(403).end();
+    }
+    try {
+        await billingService.handleStkCallback(req.body);    } catch (error) {
+        console.error('[billing] webhook/mpesa processing error:', error);
+    }
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
 module.exports = router;

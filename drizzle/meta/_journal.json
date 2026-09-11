@@ -8,6 +8,13 @@
       "when": 1786693207513,
       "tag": "0000_omniscient_wolf_cub",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1788462774012,
+      "tag": "0001_organic_gamora",
+      "breakpoints": true
     }
   ]
 }

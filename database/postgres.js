@@ -35,11 +35,9 @@ async function initDb() {
             query_timeout: 30000,
         });
 
-        // Test connection
         await pool.query('SELECT 1');
         console.log('[DB] Connected to PostgreSQL');
 
-        // Pool event listeners
         pool.on('error', (err) => {
             console.error('[DB] Pool error:', err.message);
         });
@@ -55,7 +53,6 @@ async function initDb() {
 
         initialized = true;
 
-        // Keep-alive for serverless environments
         if (process.env.NODE_ENV === 'production') {
             setInterval(async () => {
                 try {
@@ -174,7 +171,6 @@ async function deleteUser(id, hardDelete = false) {
         await db.delete(schema.users).where(sql`${schema.users.id} = ${id}`);
         return { success: true };
     }
-    // Soft delete
     const result = await db.update(schema.users)
         .set({ deletedAt: new Date(), isActive: false })
         .where(sql`${schema.users.id} = ${id}`)
@@ -243,16 +239,6 @@ async function revokeAllUserRefreshTokens(userId) {
 // ============================================================
 // REPOSITORY: MEASUREMENTS
 // ============================================================
-//
-// FIXED: schema.measurements (see db/schema.js) defines a NOT NULL
-// "parameter" column — there is no "tagId" or "rawValue" column on this
-// table. The previous version of these functions passed tagId/rawValue
-// instead of parameter, which Drizzle silently dropped (object keys with no
-// matching column are ignored), leaving "parameter" unset on every insert
-// and causing every single measurement save to fail a NOT NULL constraint.
-// All functions below now consistently use "parameter" (a string like
-// "RO5-ROPressure"), matching exactly what plcService.js's recordToDB()
-// actually sends and what the live database schema actually has.
 
 async function saveMeasurement(data) {
     const db = getDb();
@@ -323,23 +309,16 @@ async function getMeasurementAggregates(parameter, bucket = '1 hour', hours = 24
     `);
 }
 
+const PLANT_UTC_OFFSET_MS = 3 * 60 * 60 * 1000; // Africa/Nairobi = UTC+3, no DST
 
-// ============================================================
-// REPOSITORY: MEASUREMENTS — PRODUCTION VOLUME
-// ============================================================
-//
-// Integrates value (m3/hr) over time using the trapezoidal rule to get
-// total volume (m3) between startTime and endTime.
-//
-// IMPORTANT: LAG() is computed over ALL rows up to endTime, BEFORE we
-// filter into the sum. If we filtered rows into the window first (as an
-// earlier rolling-window version did), the first row inside the window
-// would have prev_time = NULL and its lead-in interval would be silently
-// dropped, undercounting every period. Instead we compute prev_time/
-// prev_value on the unfiltered series, then only sum intervals that
-// overlap [startTime, endTime], clipping the boundary-crossing interval
-// with GREATEST(prev_time, startTime) so partial coverage is counted
-// correctly instead of discarded.
+function toPlantWallClock(utcDate) {
+    return new Date(utcDate.getTime() + PLANT_UTC_OFFSET_MS);
+}
+
+function fromPlantWallClock(wallClockDate) {
+    return new Date(wallClockDate.getTime() - PLANT_UTC_OFFSET_MS);
+}
+
 async function getProductionVolume(parameter, startTime, endTime = new Date()) {
     const db = getDb();
     const result = await db.execute(sql`
@@ -377,40 +356,6 @@ async function getProductionVolume(parameter, startTime, endTime = new Date()) {
     return Number(row?.total_volume) || 0;
 }
 
-// ------------------------------------------------------------
-// Plant-local calendar boundaries (Africa/Nairobi, fixed UTC+3, no DST)
-// ------------------------------------------------------------
-//
-// FIXED: the previous version computed "today"/"this week"/etc. using
-// `new Date(now); date.setHours(0,0,0,0)`. setHours() resets the clock in
-// the SERVER's local timezone, not the plant's. If the server process runs
-// with TZ=UTC (the default on most hosts/containers), "midnight" for that
-// code was actually 03:00 EAT — so right after real local midnight in
-// Nairobi, "Today" kept summing from the *previous* day's 00:00 EAT boundary
-// (effectively still counting most of yesterday) until the server's own
-// clock rolled over three hours later. That's why the dashboard showed a
-// large "Today" total moments after visually crossing into a new day.
-//
-// The fix below computes the boundary using the plant's fixed UTC+3 offset
-// directly, regardless of what timezone the Node process itself is running
-// in, so "Today" always starts at true 00:00 Africa/Nairobi time.
-const PLANT_UTC_OFFSET_MS = 3 * 60 * 60 * 1000; // Africa/Nairobi = UTC+3, no DST
-
-// Shifts a real UTC instant so its UTC getters (getUTCFullYear, getUTCDate,
-// getUTCDay, etc.) read back as Nairobi wall-clock values.
-function toPlantWallClock(utcDate) {
-    return new Date(utcDate.getTime() + PLANT_UTC_OFFSET_MS);
-}
-
-// Converts a "wall clock" Date (built with Date.UTC using plant-local
-// year/month/day) back into the real UTC instant it represents.
-function fromPlantWallClock(wallClockDate) {
-    return new Date(wallClockDate.getTime() - PLANT_UTC_OFFSET_MS);
-}
-
-// Calendar-aligned periods: today since midnight, this week since Monday,
-// this month since the 1st, this year since Jan 1 — all anchored to
-// Africa/Nairobi local time, not rolling windows and not server-local time.
 async function getProductionSummary(parameter = 'RO5-Permeateflow') {
     const nowUTC = new Date();
     const wall = toPlantWallClock(nowUTC);
@@ -419,7 +364,7 @@ async function getProductionSummary(parameter = 'RO5-Permeateflow') {
         new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate()))
     );
 
-    const dow = wall.getUTCDay(); // Sunday = 0, evaluated in plant-local terms
+    const dow = wall.getUTCDay();
     const daysSinceMonday = dow === 0 ? 6 : dow - 1;
     const startOfWeek = fromPlantWallClock(
         new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate() - daysSinceMonday))
@@ -650,20 +595,22 @@ async function getActiveAlertRules(organizationId = null) {
     return query;
 }
 
+// ============================================================
+// REPOSITORY: SETTINGS
+// ============================================================
+
 const DEFAULT_SETTINGS = {
-  plantName: 'Nairobi Water Treatment Plant',
-  operatorId: 'WTP-2024-NBI-001',
-  productionTarget: 4200,
-  recoveryTarget: 78,
-  filterDpWarn: 0.50,
-  filterDpCrit: 0.65,
-  lowRecoveryWarn: 76,
-  lowChemAlert: 20,
-  minDosing: 2.0,
-  maxDosing: 3.0,
+    plantName: 'Nairobi Water Treatment Plant',
+    operatorId: 'WTP-2024-NBI-001',
+    productionTarget: 4200,
+    recoveryTarget: 78,
+    filterDpWarn: 0.50,
+    filterDpCrit: 0.65,
+    lowRecoveryWarn: 76,
+    lowChemAlert: 20,
+    minDosing: 2.0,
+    maxDosing: 3.0,
 };
-
-
 
 async function getSettings() {
     const db = getDb();
@@ -671,9 +618,6 @@ async function getSettings() {
         .from(schema.systemSettings)
         .where(sql`${schema.systemSettings.id} = 1`)
         .limit(1);
-
-    // First run — no row yet. Return sane defaults without writing anything,
-    // so a plain GET never has side effects.
     return result[0] || { id: 1, ...DEFAULT_SETTINGS, updatedAt: null, updatedBy: null };
 }
 
@@ -708,24 +652,10 @@ async function saveSettings(data, userId) {
 
 // ============================================================
 // REPOSITORY: BILLING
+// Fixed-price M-Pesa subscription. Status lifecycle everywhere in
+// this app is exactly: 'processing' -> 'success' | 'failed' | 'cancelled'.
+// Never write or filter on any other status string.
 // ============================================================
-
-async function getActiveBillingPlans() {
-    const db = getDb();
-    return db.select()
-        .from(schema.billingPlans)
-        .where(sql`${schema.billingPlans.isActive} = true`)
-        .orderBy(schema.billingPlans.amountKes, 'asc');
-}
-
-async function getBillingPlanByCode(code) {
-    const db = getDb();
-    const result = await db.select()
-        .from(schema.billingPlans)
-        .where(sql`${schema.billingPlans.code} = ${code} AND ${schema.billingPlans.isActive} = true`)
-        .limit(1);
-    return result[0] || null;
-}
 
 async function createBillingHistoryEntry(data) {
     const db = getDb();
@@ -735,18 +665,40 @@ async function createBillingHistoryEntry(data) {
         planCode: data.planCode,
         planName: data.planName,
         amountKes: data.amountKes,
-        paystackReference: data.paystackReference,
-        status: data.status || 'processing',
+        mpesaCheckoutRequestId: data.mpesaCheckoutRequestId,
+        mpesaMerchantRequestId: data.mpesaMerchantRequestId,
+        mpesaPhone: data.mpesaPhone,
+        status: 'processing',
     }).returning();
     return result[0];
 }
 
-async function updateBillingHistoryStatus(paystackReference, status) {
+async function getBillingHistoryByCheckoutRequestId(checkoutRequestId) {
+    const db = getDb();
+    const result = await db.select()
+        .from(schema.billingHistory)
+        .where(sql`${schema.billingHistory.mpesaCheckoutRequestId} = ${checkoutRequestId}`)
+        .limit(1);
+    return result[0] || null;
+}
+
+async function updateBillingHistoryByCheckoutRequestId(checkoutRequestId, data) {
     const db = getDb();
     const result = await db.update(schema.billingHistory)
-        .set({ status })
-        .where(sql`${schema.billingHistory.paystackReference} = ${paystackReference}`)
+        .set(data)
+        .where(sql`${schema.billingHistory.mpesaCheckoutRequestId} = ${checkoutRequestId}`)
         .returning();
+    return result[0] || null;
+}
+
+async function getPendingMpesaHistoryByUser(userId) {
+    const db = getDb();
+    const result = await db.select()
+        .from(schema.billingHistory)
+        .where(sql`${schema.billingHistory.userId} = ${userId}
+            AND ${schema.billingHistory.status} = 'processing'
+            AND ${schema.billingHistory.purchaseDate} > NOW() - INTERVAL '3 minutes'`)
+        .limit(1);
     return result[0] || null;
 }
 
@@ -769,28 +721,19 @@ async function upsertActiveSubscription(data) {
         id: generateUUID(),
         userId: data.userId,
         planCode: data.planCode,
-        paystackCustomerCode: data.paystackCustomerCode,
+        mpesaPhone: data.mpesaPhone || null,
         status: 'active',
         currentPeriodEnd: data.currentPeriodEnd || null,
     }).returning();
     return result[0];
 }
 
-async function updateSubscriptionByCustomerCode(customerCode, data) {
+async function getActiveSubscription(userId) {
     const db = getDb();
-    const result = await db.update(schema.billingSubscriptions)
-        .set({ ...data, updatedAt: new Date() })
-        .where(sql`${schema.billingSubscriptions.paystackCustomerCode} = ${customerCode}`)
-        .returning();
-    return result[0] || null;
-}
-
-async function updateSubscriptionByCode(subscriptionCode, data) {
-    const db = getDb();
-    const result = await db.update(schema.billingSubscriptions)
-        .set({ ...data, updatedAt: new Date() })
-        .where(sql`${schema.billingSubscriptions.paystackSubscriptionCode} = ${subscriptionCode}`)
-        .returning();
+    const result = await db.select()
+        .from(schema.billingSubscriptions)
+        .where(sql`${schema.billingSubscriptions.userId} = ${userId} AND ${schema.billingSubscriptions.status} = 'active'`)
+        .limit(1);
     return result[0] || null;
 }
 
@@ -857,14 +800,13 @@ module.exports = {
     saveSettings,
 
     // Billing
-    getActiveBillingPlans,
-    getBillingPlanByCode,
     createBillingHistoryEntry,
-    updateBillingHistoryStatus,
+    getBillingHistoryByCheckoutRequestId,
+    updateBillingHistoryByCheckoutRequestId,
+    getPendingMpesaHistoryByUser,
     getBillingHistoryByUser,
     upsertActiveSubscription,
-    updateSubscriptionByCustomerCode,
-    updateSubscriptionByCode,
+    getActiveSubscription,
 
     // Schema
     schema,

@@ -1,63 +1,153 @@
 // backend/services/billing.service.js
-// 'use strict';
+'use strict';
 
-const crypto = require('crypto');
 const db = require('../database/postgres');
 
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const PAYSTACK_BASE_URL = 'https://api.paystack.co';
-const TRIAL_DAYS = 30;
+const {
+    MPESA_CONSUMER_KEY,
+    MPESA_CONSUMER_SECRET,
+    MPESA_SHORTCODE,
+    MPESA_TILL_NUMBER,
+    MPESA_PASSKEY,
+    MPESA_CALLBACK_URL,
+    MPESA_ENV = 'sandbox',
+    MPESA_TRANSACTION_TYPE = 'CustomerPayBillOnline', // switch to CustomerBuyGoodsOnline after Till Go-Live
+} = process.env;
 
-if (!PAYSTACK_SECRET_KEY) {
-    console.warn('[billing] PAYSTACK_SECRET_KEY is not set — checkout/webhook calls will fail until it is configured');
+const BASE_URL = MPESA_ENV === 'production'
+    ? 'https://api.safaricom.co.ke'
+    : 'https://sandbox.safaricom.co.ke';
+
+const TRIAL_DAYS = 30;
+const CANCELLED_RESULT_CODE = 1032; // "Request cancelled by user"
+
+const SUBSCRIPTION = {
+    code: 'standard',
+    name: 'AguaWatch Subscription',
+    amountKes: 1,
+    intervalDays: 30,
+};
+
+console.log('[billing] module loaded. Config:', {
+    env: MPESA_ENV,
+    baseUrl: BASE_URL,
+    shortcode: MPESA_SHORTCODE,
+    transactionType: MPESA_TRANSACTION_TYPE,
+    keyLength: MPESA_CONSUMER_KEY?.length,
+    keyPrefix: MPESA_CONSUMER_KEY?.slice(0, 5),
+    secretLength: MPESA_CONSUMER_SECRET?.length,
+    secretPrefix: MPESA_CONSUMER_SECRET?.slice(0, 5),
+    passkeySet: !!MPESA_PASSKEY,
+    callbackUrl: MPESA_CALLBACK_URL,
+});
+
+if (!MPESA_CONSUMER_KEY || !MPESA_CONSUMER_SECRET || !MPESA_SHORTCODE || !MPESA_PASSKEY) {
+    console.error('[billing] Missing Daraja credentials — set MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET, MPESA_SHORTCODE, MPESA_PASSKEY');
 }
 
 /* ============================================================
-   PAYSTACK API HELPER
-   Node's built-in fetch (Node 18+) — no extra dependency needed.
+   OAUTH TOKEN
    ============================================================ */
 
-async function paystackRequest(path, { method = 'GET', body } = {}) {
-    const res = await fetch(`${PAYSTACK_BASE_URL}${path}`, {
-        method,
-        headers: {
-            Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-            'Content-Type': 'application/json',
-        },
-        body: body ? JSON.stringify(body) : undefined,
-    });
-    const data = await res.json();
-    if (!res.ok || data.status === false) {
-        throw new Error(data.message || `Paystack request failed (${res.status})`);
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+async function getAccessToken() {
+    if (cachedToken && Date.now() < tokenExpiresAt - 30_000) {
+        console.log('[billing] getAccessToken: using cached token');
+        return cachedToken;
     }
-    return data;
+
+    console.log('[billing] getAccessToken: requesting new token from', `${BASE_URL}/oauth/v1/generate`);
+
+    const auth = Buffer.from(`${MPESA_CONSUMER_KEY}:${MPESA_CONSUMER_SECRET}`).toString('base64');
+
+    let res;
+    try {
+        res = await fetch(`${BASE_URL}/oauth/v1/generate?grant_type=client_credentials`, {
+            headers: { Authorization: `Basic ${auth}` },
+        });
+    } catch (networkError) {
+        console.error('[billing] getAccessToken: fetch() threw before receiving a response:', networkError);
+        throw new Error(`Could not reach M-Pesa OAuth endpoint: ${networkError.message}`);
+    }
+
+    const responseText = await res.text();
+    console.log('[billing] getAccessToken: HTTP', res.status, '- raw body:', JSON.stringify(responseText).slice(0, 300));
+
+    let data;
+    try {
+        data = JSON.parse(responseText);
+    } catch {
+        throw new Error(
+            `M-Pesa OAuth endpoint returned a non-JSON response (HTTP ${res.status}). ` +
+            `Raw response: ${responseText.slice(0, 200)}`
+        );
+    }
+
+    if (!res.ok || !data.access_token) {
+        throw new Error(data.errorMessage || `Failed to obtain M-Pesa access token (HTTP ${res.status})`);
+    }
+
+    cachedToken = data.access_token;
+    tokenExpiresAt = Date.now() + Number(data.expires_in || 3599) * 1000;
+    console.log('[billing] getAccessToken: success, token cached for', data.expires_in, 'seconds');
+    return cachedToken;
+}
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
+function timestampNow() {
+    const nairobi = new Date(Date.now() + 3 * 60 * 60 * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    return (
+        nairobi.getUTCFullYear().toString() +
+        pad(nairobi.getUTCMonth() + 1) +
+        pad(nairobi.getUTCDate()) +
+        pad(nairobi.getUTCHours()) +
+        pad(nairobi.getUTCMinutes()) +
+        pad(nairobi.getUTCSeconds())
+    );
+}
+
+function buildPassword(timestamp) {
+    return Buffer.from(`${MPESA_SHORTCODE}${MPESA_PASSKEY}${timestamp}`).toString('base64');
+}
+
+function normalizeMsisdn(phone) {
+    const digits = String(phone).replace(/\D/g, '');
+    if (digits.startsWith('254') && digits.length === 12) return digits;
+    if (digits.startsWith('0') && digits.length === 10) return `254${digits.slice(1)}`;
+    if ((digits.startsWith('7') || digits.startsWith('1')) && digits.length === 9) return `254${digits}`;
+    throw new Error(`Unrecognized phone number format: ${phone}`);
+}
+
+async function darajaFetch(url, options) {
+    let res;
+    try {
+        res = await fetch(url, options);
+    } catch (networkError) {
+        throw new Error(`Could not reach M-Pesa (${url}): ${networkError.message}`);
+    }
+
+    const responseText = await res.text();
+    let data;
+    try {
+        data = JSON.parse(responseText);
+    } catch {
+        throw new Error(`M-Pesa returned a non-JSON response (HTTP ${res.status}): ${responseText.slice(0, 200)}`);
+    }
+    return { ok: res.ok, status: res.status, data };
 }
 
 /* ============================================================
    TRIAL / SUBSCRIPTION STATUS
    ============================================================ */
 
-/**
- * Computes what the frontend needs to know about a user's access level.
- * Priority: an active paid subscription always wins. Otherwise, fall
- * back to a 30-day trial counted from account creation.
- *
- * Returns one of:
- *   { subscriptionStatus: 'active',  planCode, currentPeriodEnd }
- *   { subscriptionStatus: 'trial',   daysRemaining }
- *   { subscriptionStatus: 'expired', daysRemaining: 0 }
- */
 async function getSubscriptionStatus(userId, userCreatedAt) {
-    const db2 = db.getDb();
-    const rows = await db2
-        .select()
-        .from(db.schema.billingSubscriptions)
-        .where(
-            require('drizzle-orm').sql`${db.schema.billingSubscriptions.userId} = ${userId} AND ${db.schema.billingSubscriptions.status} = 'active'`
-        )
-        .limit(1);
-
-    const activeSub = rows[0] || null;
+    const activeSub = await db.getActiveSubscription(userId);
 
     if (activeSub && (!activeSub.currentPeriodEnd || new Date(activeSub.currentPeriodEnd) > new Date())) {
         return {
@@ -67,10 +157,8 @@ async function getSubscriptionStatus(userId, userCreatedAt) {
         };
     }
 
-    // No active paid subscription — fall back to trial window.
     const createdAt = userCreatedAt ? new Date(userCreatedAt) : new Date();
-    const msElapsed = Date.now() - createdAt.getTime();
-    const daysElapsed = Math.floor(msElapsed / (24 * 60 * 60 * 1000));
+    const daysElapsed = Math.floor((Date.now() - createdAt.getTime()) / (24 * 60 * 60 * 1000));
     const daysRemaining = Math.max(0, TRIAL_DAYS - daysElapsed);
 
     if (daysRemaining > 0) {
@@ -84,7 +172,7 @@ async function getSubscriptionStatus(userId, userCreatedAt) {
    ============================================================ */
 
 async function getPlans() {
-    return db.getActiveBillingPlans();
+    return [SUBSCRIPTION];
 }
 
 async function getHistory(userId) {
@@ -92,111 +180,181 @@ async function getHistory(userId) {
 }
 
 /* ============================================================
-   CHECKOUT
+   STK PUSH
    ============================================================ */
 
-async function initializeCheckout({ userId, email, planCode }) {
-    const plan = await db.getBillingPlanByCode(planCode);
-    if (!plan) throw new Error('Plan not found');
-    if (!plan.paystackPlanCode) throw new Error('This plan requires contacting sales — no self-serve checkout');
+async function initiateStkPush({ userId, phone }) {
+    console.log(`[billing] initiateStkPush: user=${userId} phone=${phone}`);
 
-    const reference = `aqs_${crypto.randomBytes(12).toString('hex')}`;
+    const pending = await db.getPendingMpesaHistoryByUser(userId);
+    if (pending) {
+        throw new Error('A payment request is already pending on your phone. Please complete or cancel it before trying again.');
+    }
 
-    // Record the attempt immediately as 'processing' so it shows in
-    // Billing History right away, and so the webhook has a matching
-    // row to update by reference when Paystack confirms it later.
-    await db.createBillingHistoryEntry({
-        userId,
-        planCode: plan.code,
-        planName: plan.name,
-        amountKes: plan.amountKes,
-        paystackReference: reference,
-        status: 'processing',
-    });
+    const token = await getAccessToken();
+    const timestamp = timestampNow();
+    const password = buildPassword(timestamp);
+    const msisdn = normalizeMsisdn(phone);
+    const amount = Math.round(SUBSCRIPTION.amountKes);
 
-    const initData = await paystackRequest('/transaction/initialize', {
+    const body = {
+        BusinessShortCode: MPESA_SHORTCODE,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: MPESA_TRANSACTION_TYPE,
+        Amount: amount,
+        PartyA: msisdn,
+        PartyB: MPESA_TRANSACTION_TYPE === 'CustomerBuyGoodsOnline'
+            ? (MPESA_TILL_NUMBER || MPESA_SHORTCODE)
+            : MPESA_SHORTCODE,
+        PhoneNumber: msisdn,
+        CallBackURL: MPESA_CALLBACK_URL,
+        AccountReference: SUBSCRIPTION.code.slice(0, 12),
+        TransactionDesc: 'Subscription',
+    };
+
+    console.log('[billing] initiateStkPush: request body:', JSON.stringify(body));
+
+    const { ok, status, data } = await darajaFetch(`${BASE_URL}/mpesa/stkpush/v1/processrequest`, {
         method: 'POST',
-        body: {
-            email,
-            amount: Math.round(plan.amountKes * 100), // Paystack expects kobo/cents-equivalent
-            currency: 'KES',
-            reference,
-            plan: plan.paystackPlanCode, // enables recurring billing on Paystack's side
-            metadata: { userId, planCode: plan.code },
-        },
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
     });
+
+    console.log('[billing] initiateStkPush: response:', status, JSON.stringify(data));
+
+    if (!ok || data.ResponseCode !== '0') {
+        const knownErrors = {
+            '500.001.1001': 'There is already a pending payment request on that phone, or a session lock. Wait a minute and try again.',
+            '400.002.02': 'M-Pesa rejected the request as malformed. Check BusinessShortCode/Password/Timestamp.',
+            '404.001.03': 'M-Pesa access token was invalid or expired.',
+        };
+        throw new Error(knownErrors[data.ResponseCode] || data.errorMessage || data.ResponseDescription || `STK push request failed (HTTP ${status})`);
+    }
+
+    try {
+        await db.createBillingHistoryEntry({
+            userId,
+            planCode: SUBSCRIPTION.code,
+            planName: SUBSCRIPTION.name,
+            amountKes: SUBSCRIPTION.amountKes,
+            mpesaCheckoutRequestId: data.CheckoutRequestID,
+            mpesaMerchantRequestId: data.MerchantRequestID,
+            mpesaPhone: msisdn,
+        });
+    } catch (dbError) {
+        // The STK push already succeeded on Safaricom's side — don't fail
+        // the whole request just because our own history log write failed.
+        console.error('[billing] initiateStkPush: failed to write billing history:', dbError.message);
+    }
 
     return {
-        authorizationUrl: initData.data.authorization_url,
-        reference,
+        checkoutRequestId: data.CheckoutRequestID,
+        merchantRequestId: data.MerchantRequestID,
+        customerMessage: data.CustomerMessage,
     };
 }
 
-/* ============================================================
-   WEBHOOK
-   ============================================================ */
+async function queryStkStatus(checkoutRequestId) {
+    const token = await getAccessToken();
+    const timestamp = timestampNow();
+    const password = buildPassword(timestamp);
 
-function verifyWebhookSignature(rawBody, signatureHeader) {
-    if (!PAYSTACK_SECRET_KEY || !signatureHeader) return false;
-    const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(rawBody).digest('hex');
-    return hash === signatureHeader;
+    const { data } = await darajaFetch(`${BASE_URL}/mpesa/stkpushquery/v1/query`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            BusinessShortCode: MPESA_SHORTCODE,
+            Password: password,
+            Timestamp: timestamp,
+            CheckoutRequestID: checkoutRequestId,
+        }),
+    });
+
+    return data;
 }
 
-async function handleWebhookEvent(event) {
-    const { event: eventType, data } = event;
+/* ============================================================
+   RESOLUTION — the ONLY place that writes a final status.
+   Idempotent by checking the existing row first.
+   ============================================================ */
 
-    switch (eventType) {
-        case 'charge.success': {
-            const reference = data.reference;
-            const metadata = data.metadata || {};
-            const userId = metadata.userId;
-            const planCode = metadata.planCode;
-
-            await db.updateBillingHistoryStatus(reference, 'success');
-
-            if (userId && planCode) {
-                const plan = await db.getBillingPlanByCode(planCode);
-                const periodDays = plan?.interval === 'yearly' ? 365 : 30;
-                const currentPeriodEnd = new Date(Date.now() + periodDays * 24 * 60 * 60 * 1000);
-
-                await db.upsertActiveSubscription({
-                    userId,
-                    planCode,
-                    paystackCustomerCode: data.customer?.customer_code || null,
-                    currentPeriodEnd,
-                });
-            }
-            break;
-        }
-
-        case 'subscription.disable':
-        case 'subscription.not_renew': {
-            const customerCode = data.customer?.customer_code;
-            if (customerCode) {
-                await db.updateSubscriptionByCustomerCode(customerCode, { status: 'cancelled' });
-            }
-            break;
-        }
-
-        case 'invoice.payment_failed': {
-            const reference = data.transaction_reference || data.reference;
-            if (reference) {
-                await db.updateBillingHistoryStatus(reference, 'failed');
-            }
-            break;
-        }
-
-        default:
-            console.log(`[billing] Unhandled Paystack event: ${eventType}`);
+async function resolveStkResult(checkoutRequestId, resultCode, metadataItems = []) {
+    const existing = await db.getBillingHistoryByCheckoutRequestId(checkoutRequestId);
+    if (existing && existing.status !== 'processing') {
+        return { status: existing.status, alreadyProcessed: true };
     }
+
+    const code = Number(resultCode);
+
+    if (code === 0) {
+        const getItem = (name) => metadataItems.find((i) => i.Name === name)?.Value;
+        const mpesaReceiptNumber = getItem('MpesaReceiptNumber');
+
+        const historyEntry = await db.updateBillingHistoryByCheckoutRequestId(checkoutRequestId, {
+            status: 'success',
+            mpesaReceiptNumber,
+        });
+
+        if (historyEntry) {
+            const currentPeriodEnd = new Date(Date.now() + SUBSCRIPTION.intervalDays * 24 * 60 * 60 * 1000);
+            await db.upsertActiveSubscription({
+                userId: historyEntry.userId,
+                planCode: SUBSCRIPTION.code,
+                mpesaPhone: historyEntry.mpesaPhone,
+                currentPeriodEnd,
+            });
+        }
+        return { status: 'success' };
+    }
+
+    const status = code === CANCELLED_RESULT_CODE ? 'cancelled' : 'failed';
+    await db.updateBillingHistoryByCheckoutRequestId(checkoutRequestId, { status });
+    return { status };
+}
+
+/* ============================================================
+   CALLBACK
+   ============================================================ */
+
+async function handleStkCallback(body) {
+    const callback = body?.Body?.stkCallback;
+    if (!callback?.CheckoutRequestID) {
+        console.warn('[billing] M-Pesa callback missing stkCallback/CheckoutRequestID');
+        return;
+    }
+
+    const metadataItems = callback.CallbackMetadata?.Item || [];
+    await resolveStkResult(callback.CheckoutRequestID, callback.ResultCode, metadataItems);
+}
+
+/* ============================================================
+   STATUS — client polling endpoint
+   ============================================================ */
+
+async function checkStkStatus(checkoutRequestId) {
+    const existing = await db.getBillingHistoryByCheckoutRequestId(checkoutRequestId);
+    if (existing && existing.status !== 'processing') {
+        return { ResultCode: existing.status === 'success' ? 0 : 1, status: existing.status };
+    }
+
+    const result = await queryStkStatus(checkoutRequestId);
+    const code = Number(result.ResultCode);
+
+    if (!Number.isNaN(code)) {
+        await resolveStkResult(checkoutRequestId, code);
+    }
+
+    return result;
 }
 
 module.exports = {
     TRIAL_DAYS,
+    SUBSCRIPTION,
     getSubscriptionStatus,
     getPlans,
     getHistory,
-    initializeCheckout,
-    verifyWebhookSignature,
-    handleWebhookEvent,
+    initiateStkPush,
+    checkStkStatus,
+    handleStkCallback,
 };

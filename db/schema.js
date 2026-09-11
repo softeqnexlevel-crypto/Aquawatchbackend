@@ -29,11 +29,6 @@ const users = pgTable('users', {
   permissions: jsonb('permissions').default([]),
   preferences: jsonb('preferences').default({}),
   isActive: boolean('is_active').default(true),
-  
-  // ---- REMOVE THESE TWO LINES BELOW ----
-  // otpSecret: text('otp_secret'),
-  // otpEnabled: boolean('otp_enabled').default(true),
-
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
   deletedAt: timestamp('deleted_at', { withTimezone: true }),
@@ -59,10 +54,6 @@ const refreshTokens = pgTable('refresh_tokens', {
 
 /* ============================================================
    MEASUREMENTS
-   NOTE: uses "parameter" (matches the currently-active saveMeasurement()
-   which does data.parameter, not data.tagId). If you're running the
-   fuller tagId-based postgres.js instead, swap `parameter` below for a
-   `tagId: uuid('tag_id')` column and update the indexes accordingly.
    ============================================================ */
 const measurements = pgTable('measurements', {
   id: uuid('id').primaryKey(),
@@ -182,57 +173,52 @@ const alertRules = pgTable('alert_rules', {
 });
 
 /* ============================================================
-   BILLING PLANS
-   Seeded rows: 'starter', 'growth', 'enterprise'. paystackPlanCode is
-   NULL for enterprise (no self-serve checkout — "Contact Us" instead).
-   ============================================================ */
-const billingPlans = pgTable('billing_plans', {
-  id: uuid('id').primaryKey(),
-  code: varchar('code', { length: 50 }).notNull().unique(),
-  name: varchar('name', { length: 100 }).notNull(),
-  paystackPlanCode: varchar('paystack_plan_code', { length: 100 }),
-  amountKes: doublePrecision('amount_kes').notNull().default(0),
-  interval: varchar('interval', { length: 20 }).notNull().default('monthly'),
-  features: jsonb('features').default([]),
-  isActive: boolean('is_active').default(true),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
-});
-
-/* ============================================================
    BILLING SUBSCRIPTIONS
+   One row per subscription lifecycle event, keyed off userId.
+   Fixed pricing — no billing_plans table. mpesaPhone kept only for
+   reference/support since M-Pesa STK has no persistent "customer" object.
    ============================================================ */
 const billingSubscriptions = pgTable('billing_subscriptions', {
   id: uuid('id').primaryKey(),
   userId: uuid('user_id').notNull(),
-  planCode: varchar('plan_code', { length: 50 }).notNull(),
-  paystackCustomerCode: varchar('paystack_customer_code', { length: 100 }),
-  paystackSubscriptionCode: varchar('paystack_subscription_code', { length: 100 }),
-  paystackEmailToken: varchar('paystack_email_token', { length: 100 }),
-  status: varchar('status', { length: 20 }).notNull().default('inactive'),
+  planCode: varchar('plan_code', { length: 50 }).notNull().default('standard'),
+  mpesaPhone: varchar('mpesa_phone', { length: 20 }),
+  status: varchar('status', { length: 20 }).notNull().default('active'), // 'active' | 'cancelled' | 'replaced'
   currentPeriodEnd: timestamp('current_period_end', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
 }, (table) => ({
-  userIdx: index('billing_subscriptions_user_idx').on(table.userId),
+  userStatusIdx: index('billing_subscriptions_user_status_idx').on(table.userId, table.status),
 }));
 
 /* ============================================================
    BILLING HISTORY
+   One row per STK push attempt. Status lifecycle everywhere in this
+   app is exactly: 'processing' -> 'success' | 'failed' | 'cancelled'.
+   mpesaCheckoutRequestId is the lookup key used by both the callback
+   handler and the client polling endpoint.
    ============================================================ */
 const billingHistory = pgTable('billing_history', {
   id: uuid('id').primaryKey(),
   userId: uuid('user_id').notNull(),
-  planCode: varchar('plan_code', { length: 50 }).notNull(),
-  planName: varchar('plan_name', { length: 100 }).notNull(),
-  amountKes: doublePrecision('amount_kes').notNull(),
-  paystackReference: varchar('paystack_reference', { length: 100 }).unique(),
+  planCode: varchar('plan_code', { length: 50 }).notNull().default('standard'),
+  planName: varchar('plan_name', { length: 100 }).notNull().default('AguaWatch Subscription'),
+  amountKes: doublePrecision('amount_kes').notNull().default(25000),
+  mpesaCheckoutRequestId: varchar('mpesa_checkout_request_id', { length: 100 }).unique(),
+  mpesaMerchantRequestId: varchar('mpesa_merchant_request_id', { length: 100 }),
+  mpesaReceiptNumber: varchar('mpesa_receipt_number', { length: 50 }),
+  mpesaPhone: varchar('mpesa_phone', { length: 20 }),
   status: varchar('status', { length: 20 }).notNull().default('processing'),
   purchaseDate: timestamp('purchase_date', { withTimezone: true }).defaultNow(),
   periodEnd: timestamp('period_end', { withTimezone: true }),
 }, (table) => ({
   userDateIdx: index('billing_history_user_date_idx').on(table.userId, table.purchaseDate),
+  checkoutRequestIdx: index('billing_history_checkout_request_idx').on(table.mpesaCheckoutRequestId),
 }));
 
+/* ============================================================
+   SYSTEM SETTINGS
+   ============================================================ */
 const systemSettings = pgTable('system_settings', {
   id: integer('id').primaryKey(),
   plantName: varchar('plant_name', { length: 255 }),
@@ -259,7 +245,6 @@ module.exports = {
   auditLogs,
   systemSettings,
   alertRules,
-  billingPlans,
   billingSubscriptions,
   billingHistory,
 };

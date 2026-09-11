@@ -14,14 +14,7 @@ const ARCHIVE_RAW_FAILED = Boolean(process.env.ARCHIVE_RAW_FAILED && process.env
 const CALIBRATION_FILE = process.env.CALIBRATION_FILE || path.resolve(__dirname, '..', 'data', 'calibration.json');
 const MIN_VALID_ABS_VALUE = Number(process.env.MIN_VALID_ABS_VALUE) || 1e-6;
 
-// ============================================================
-// ✅ NEW: file-based debug logger. Writes directly via fs, so it
-// works regardless of shell/TTY/winpty redirection issues on
-// Windows git-bash. Always-on (not gated behind DEBUG_PARSE) so
-// we can trace exactly what happens to specific records like
-// AntiscalantDoser without needing env vars or terminal redirects.
-// Log file: backend/debug.log
-// ============================================================
+
 const DEBUG_LOG_FILE = path.resolve(__dirname, '..', 'debug.log');
 
 function dlog(...args) {
@@ -157,10 +150,7 @@ function parseNamedRecords(buf) {
         value = buf[i + 13] || 0;
         dataType = 'bit';
       } else {
-        // ✅ NEW: log unhandled lenByte values so we can see if
-        // AntiscalantDoser's record uses a length we don't handle at all
-        // (e.g. 2-byte word) and is being skipped before name resolution
-        // even starts.
+
         dlog('SKIPPED-UNHANDLED-LEN', { offset: i, recordIndex, typeByte, lenByte });
         continue;
       }
@@ -168,15 +158,6 @@ function parseNamedRecords(buf) {
       continue;
     }
 
-    // ✅ FIX: these were hardcoded as i+17 / i+18, which only happens to be
-    // correct for 4-byte float records (13 + 4 = 17). For 1-byte bit
-    // records, the value only occupies byte i+13, so the next field
-    // actually starts at i+14 — the old hardcoded offsets read 3 bytes into
-    // the wrong location for every bit-type record (AntiscalantDosingActive,
-    // SystemOperation, SystemMode), corrupting name/unit resolution for all
-    // of them. Computing the offset from the real value length (lenByte)
-    // fixes bit records while leaving float records completely unchanged
-    // (13 + 4 + 1 = 18, same as before).
     const nameLenDeclared = buf[i + 13 + lenByte];
     const nameStartBase = i + 13 + lenByte + 1;
 
@@ -203,8 +184,7 @@ function parseNamedRecords(buf) {
     }
 
     if (!parsed) {
-      // ✅ CHANGED: was gated behind `if (DEBUG_PARSE)` using console.warn.
-      // Now always writes to debug.log via dlog(), plus a small hexdump
+      // Always writes to debug.log via dlog(), plus a small hexdump
       // slice around the failed record so we can inspect the actual bytes
       // without needing to re-run with DEBUG_PARSE or fight shell redirects.
       const sliceStart = Math.max(0, i);
@@ -224,7 +204,7 @@ function parseNamedRecords(buf) {
       continue;
     }
 
-    // ✅ NEW: log every successfully resolved record so we can confirm
+    // Log every successfully resolved record so we can confirm
     // exactly which parameter names come out of the parser each cycle,
     // and cross-check whether "AntiscalantDoser" appears here at all.
     dlog('RESOLVED', { offset: i, recordIndex, name: parsed.name, unit: parsed.unit, value, dataType });
@@ -242,7 +222,7 @@ function parseNamedRecords(buf) {
     });
   }
 
-  // ✅ NEW: summary line per payload — markers found vs records resolved.
+  // Summary line per payload — markers found vs records resolved.
   // If these numbers don't match, records are being silently dropped.
   dlog('SUMMARY', { markersFound: markers.length, recordsResolved: records.length });
 
@@ -399,15 +379,15 @@ function recordToDB(record) {
 function processMeasurement(topic, measurement, idx, rawBuf) {
   let parameter = measurement.parameter || parameterFromTopic(topic) || null;
 
-  if (parameter === 'AntiscalantDoser' || parameter === 'DosingActive' || 
+  if (parameter === 'AntiscalantDoser' || parameter === 'DosingActive' ||
       parameter === 'Doser' || parameter === 'Dosing' || parameter === 'Antiscalant') {
-    // ✅ NEW: log every time an antiscalant alias is recognized here, so we
+    // Log every time an antiscalant alias is recognized here, so we
     // can confirm processMeasurement is actually being reached for it.
     dlog('ANTISCALANT-ALIAS-MATCHED', { originalParameter: parameter, topic, value: measurement.value });
     parameter = 'AntiscalantDosingActive';
   }
 
-  if (parameter === 'RO5-FeedTankLevel' || parameter === 'FeedTankLevel' || 
+  if (parameter === 'RO5-FeedTankLevel' || parameter === 'FeedTankLevel' ||
       parameter === 'FT-A' || parameter === 'FeedTank') {
     const rawValue = measurement.value;
     const scaledValue = rawValue * 7.83;
@@ -458,11 +438,32 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       });
     }
 
+    // ✅ NEW (fix): run the scaled feed tank level through the SAME alarm
+    // pipeline every other parameter uses. Previously this branch always
+    // hit `return` below before reaching `evaluate()`, so a low or empty
+    // feed tank could NEVER raise an alarm regardless of what thresholds
+    // existed in alarmService.js — this is why "Active Alarms" stayed at
+    // 0 / "All clear" even when the tank was physically empty.
+    try {
+      const alarms = evaluate(scaledRecord.parameter, scaledValue);
+      if (alarms && alarms.length) {
+        dlog('FEED-TANK-ALARM', { parameter: scaledRecord.parameter, value: scaledValue, alarms });
+        broadcast('plc-alarm', {
+          parameter: scaledRecord.parameter,
+          value: scaledValue,
+          alarms,
+          simulated: scaledRecord.simulated
+        });
+      }
+    } catch (err) {
+      console.error('[plc] feed tank evaluate/broadcast error:', err && err.message ? err.message : err);
+    }
+
     return;
   }
 
   if (!isValidParameterName(parameter)) {
-    // ✅ NEW: log when a parameter name fails validation and gets
+    // Log when a parameter name fails validation and gets
     // overwritten with a generic "unknown_N" fallback — this would also
     // explain data silently disappearing under a useless key.
     dlog('INVALID-PARAMETER-NAME', { original: parameter, topic });
@@ -531,7 +532,7 @@ function handleIncoming(topic, raw) {
 
   if (!rawBuf) return;
 
-  // ✅ NEW: unconditional raw-payload logging (ASCII form) so we can grep
+  // Unconditional raw-payload logging (ASCII form) so we can grep
   // debug.log for "Antiscalant" and see immediately whether the string
   // shows up anywhere in what the ABox actually sent, independent of
   // whether the parser succeeds in extracting it as a record.
@@ -547,7 +548,7 @@ function handleIncoming(topic, raw) {
     if (DEBUG_PARSE) console.debug('[plc] decoded hexdump head:\n' + hexdump(decodedBuf, 256));
   }
 
-  // ✅ NEW: also log the decoded (post hex-peel) ASCII — this is the buffer
+  // Also log the decoded (post hex-peel) ASCII — this is the buffer
   // that parseNamedRecords actually scans, so if "Antiscalant" appears in
   // INCOMING but not here, the hex-peeling step is corrupting/eating it.
   dlog('DECODED', {
@@ -605,12 +606,6 @@ function handleIncoming(topic, raw) {
       dlog('ANTISCALANT-BIT-CONVERTED', { originalParameter: record.parameter, value: record.value });
       record.parameter = 'AntiscalantDosingActive';
     }
-  }
-
-  // ✅ ADD THIS RIGHT HERE
-  if (record.parameter === 'AntiscalantDosingActive') {
-    record.value = 'ON';
-    console.log('🔴 FORCED ANTISCALANT TO ON FOR TESTING');
   }
 });
 
