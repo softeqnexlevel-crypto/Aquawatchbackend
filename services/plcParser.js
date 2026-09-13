@@ -438,12 +438,7 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       });
     }
 
-    // ✅ NEW (fix): run the scaled feed tank level through the SAME alarm
-    // pipeline every other parameter uses. Previously this branch always
-    // hit `return` below before reaching `evaluate()`, so a low or empty
-    // feed tank could NEVER raise an alarm regardless of what thresholds
-    // existed in alarmService.js — this is why "Active Alarms" stayed at
-    // 0 / "All clear" even when the tank was physically empty.
+    
     try {
       const alarms = evaluate(scaledRecord.parameter, scaledValue);
       if (alarms && alarms.length) {
@@ -463,9 +458,7 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
   }
 
   if (!isValidParameterName(parameter)) {
-    // Log when a parameter name fails validation and gets
-    // overwritten with a generic "unknown_N" fallback — this would also
-    // explain data silently disappearing under a useless key.
+   
     dlog('INVALID-PARAMETER-NAME', { original: parameter, topic });
     parameter = parameterFromTopic(topic) || `unknown_${idx || 'x'}`;
   }

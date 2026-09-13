@@ -24,7 +24,7 @@ const CANCELLED_RESULT_CODE = 1032; // "Request cancelled by user"
 const SUBSCRIPTION = {
     code: 'standard',
     name: 'AguaWatch Subscription',
-    amountKes: 1,
+    amountKes: 25000,
     intervalDays: 30,
 };
 
