@@ -172,6 +172,22 @@ const alertRules = pgTable('alert_rules', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 });
 
+
+const dosingTotals = pgTable('dosing_totals', {
+  id: uuid('id').primaryKey(),
+  day: varchar('day', { length: 10 }).notNull().unique(),   // 'YYYY-MM-DD' in plant-local time
+  month: varchar('month', { length: 7 }).notNull(),          // 'YYYY-MM' in plant-local time
+  secondsOn: doublePrecision('seconds_on').notNull().default(0),
+  mlDosed: doublePrecision('ml_dosed').notNull().default(0),
+  primedToday: boolean('primed_today').notNull().default(false),
+  lastOnState: boolean('last_on_state').notNull().default(false),
+  lastOnAt: timestamp('last_on_at', { withTimezone: true }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+}, (table) => ({
+  monthIdx: index('dosing_totals_month_idx').on(table.month),
+}));
+
+
 /* ============================================================
    BILLING SUBSCRIPTIONS
    One row per subscription lifecycle event, keyed off userId.
@@ -247,4 +263,5 @@ module.exports = {
   alertRules,
   billingSubscriptions,
   billingHistory,
+   dosingTotals,
 };

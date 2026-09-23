@@ -7,6 +7,7 @@ const { parameterFromTopic, KNOWN_PARAMETERS } = require('../mqtt/topicManager')
 const { broadcast } = require('./socketService');
 const { evaluate } = require('./alarmService');
 const { saveMeasurement } = require('../database/postgres');
+const { recordDosingState } = require('./dosingService');
 
 const DEBUG_PARSE = Boolean(process.env.DEBUG_PARSE && process.env.DEBUG_PARSE !== '0');
 const LOG_RAW = process.env.LOG_RAW === undefined ? true : process.env.LOG_RAW !== '0';
@@ -385,6 +386,20 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     // can confirm processMeasurement is actually being reached for it.
     dlog('ANTISCALANT-ALIAS-MATCHED', { originalParameter: parameter, topic, value: measurement.value });
     parameter = 'AntiscalantDosingActive';
+  }
+
+  // ── Feed the server-side dosing totalizer ────────────────────────────
+  // Runs on every PLC report of the dosing bit, whether or not any browser
+  // is connected. This is the single source of truth for "how much
+  // antiscalant has been dosed today". The value may be 'ON'/'OFF' (already
+  // normalized by handleIncoming) or a raw 1/0 — recordDosingState handles
+  // all forms.
+  if (parameter === 'AntiscalantDosingActive') {
+    try {
+      recordDosingState(measurement.value, Date.now());
+    } catch (err) {
+      console.error('[plc] dosing totalizer error:', err && err.message ? err.message : err);
+    }
   }
 
   if (parameter === 'RO5-FeedTankLevel' || parameter === 'FeedTankLevel' ||

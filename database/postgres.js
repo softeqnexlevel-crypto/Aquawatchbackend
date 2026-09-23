@@ -650,6 +650,80 @@ async function saveSettings(data, userId) {
     return result[0];
 }
 
+const PLANT_TZ_OFFSET_MS = 3 * 60 * 60 * 1000;
+
+function dosingDayKey(date = new Date()) {
+  const wall = new Date(date.getTime() + PLANT_TZ_OFFSET_MS);
+  const y = wall.getUTCFullYear();
+  const m = String(wall.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(wall.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+function dosingMonthKey(date = new Date()) {
+  const wall = new Date(date.getTime() + PLANT_TZ_OFFSET_MS);
+  return `${wall.getUTCFullYear()}-${String(wall.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+async function getDosingTotalsForDay(day) {
+  const db = getDb();
+  const rows = await db.select()
+    .from(schema.dosingTotals)
+    .where(sql`${schema.dosingTotals.day} = ${day}`)
+    .limit(1);
+  return rows[0] || null;
+}
+
+async function upsertDosingTotals(data) {
+  const db = getDb();
+  const now = new Date();
+  const values = {
+    id: data.id || generateUUID(),
+    day: data.day,
+    month: data.month,
+    secondsOn: data.secondsOn,
+    mlDosed: data.mlDosed,
+    primedToday: data.primedToday,
+    lastOnState: data.lastOnState,
+    lastOnAt: data.lastOnAt,
+    updatedAt: now,
+  };
+  const result = await db.insert(schema.dosingTotals)
+    .values(values)
+    .onConflictDoUpdate({
+      target: schema.dosingTotals.day,
+      set: {
+        month: values.month,
+        secondsOn: values.secondsOn,
+        mlDosed: values.mlDosed,
+        primedToday: values.primedToday,
+        lastOnState: values.lastOnState,
+        lastOnAt: values.lastOnAt,
+        updatedAt: now,
+      },
+    })
+    .returning();
+  return result[0];
+}
+
+async function getDosingHistoryForMonth(month) {
+  const db = getDb();
+  return db.select()
+    .from(schema.dosingTotals)
+    .where(sql`${schema.dosingTotals.month} = ${month}`)
+    .orderBy(schema.dosingTotals.day, 'asc');
+}
+
+async function getDosingCurrentMonthTotal() {
+  const db = getDb();
+  const month = dosingMonthKey();
+  const rows = await db.select()
+    .from(schema.dosingTotals)
+    .where(sql`${schema.dosingTotals.month} = ${month}`);
+  const ml = rows.reduce((sum, r) => sum + (Number(r.mlDosed) || 0), 0);
+  const sec = rows.reduce((sum, r) => sum + (Number(r.secondsOn) || 0), 0);
+  return { month, mlDosed: ml, secondsOn: sec, dayCount: rows.length };
+}
+
 // ============================================================
 // REPOSITORY: BILLING
 // Fixed-price M-Pesa subscription. Status lifecycle everywhere in
@@ -807,6 +881,14 @@ module.exports = {
     getBillingHistoryByUser,
     upsertActiveSubscription,
     getActiveSubscription,
+
+ // Dosing totals
+    getDosingTotalsForDay,
+    upsertDosingTotals,
+    getDosingHistoryForMonth,
+    getDosingCurrentMonthTotal,
+    dosingDayKey,
+    dosingMonthKey,
 
     // Schema
     schema,
