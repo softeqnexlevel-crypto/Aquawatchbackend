@@ -1,209 +1,811 @@
-// services/dosingService.js
-//
-// Server-side totalizer for the antiscalant dosing pump.
-//
-// plcService calls `recordDosingState(value)` every time the PLC reports
-// `AntiscalantDosingActive`. This module owns the running count and persists
-// it via the existing Drizzle repo. The frontend only *reads* the total.
-//
-// Why server-side: the previous implementation counted seconds in the
-// browser, which loses data on logout, tab close, laptop sleep, and every
-// time the user navigates away from the Antiscalant page. The backend is
-// the only process guaranteed to be running whenever the PLC is sending.
+/**
+ * services/dosingService.js
+ *
+ * Antiscalant dosing totalizer.
+ *
+ * IMPORTANT:
+ * - The PLC is the source of ON/OFF state.
+ * - The browser/dashboard is NOT involved in accumulation.
+ * - PostgreSQL persists the daily total.
+ * - Logging out of the dashboard must not affect dosing totals.
+ * - Totals reset automatically when the plant-local calendar day changes.
+ */
 
 const {
   getDosingTotalsForDay,
   upsertDosingTotals,
-  getDosingCurrentMonthTotal,
-  dosingDayKey,
-  dosingMonthKey,
 } = require('../database/postgres');
 
-// 2.7 ml/min ÷ 60 = 0.045 ml/s. Prime is one second's worth.
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+/**
+ * Pump dosing rate.
+ *
+ * Existing system:
+ * 2.7 ml/min
+ *
+ * Therefore:
+ * 2.7 / 60 = 0.045 ml/sec
+ */
 const DOSING_RATE_ML_PER_SEC = 2.7 / 60;
 
-// Don't credit more than this many seconds in a single transition. If the
-// backend was down for hours, we don't want to back-fill phantom pump time.
+/**
+ * Maximum amount of elapsed time we will credit from a single
+ * PLC report gap.
+ *
+ * This protects against a stale PLC message / backend delay
+ * causing a huge accidental dosing total.
+ */
 const MAX_GAP_SEC = 65;
 
-// In-memory state. Single writer (MQTT handler runs in one Node process),
-// so no locking required. Flushed to Postgres on every change.
-let state = {
+/**
+ * How frequently the accumulated total should be persisted.
+ *
+ * The PLC can report more frequently than this, but we don't
+ * need to write to PostgreSQL on every PLC message.
+ */
+const FLUSH_INTERVAL_MS = 5000;
+
+/**
+ * Nairobi / Kenya is UTC+3.
+ *
+ * We deliberately calculate the dosing day using the plant-local
+ * date rather than the Node server's local timezone.
+ */
+const PLANT_UTC_OFFSET_MINUTES = 3 * 60;
+
+
+// ============================================================
+// STATE
+// ============================================================
+
+const state = {
   id: null,
+
   day: null,
   month: null,
+
+  /**
+   * Total number of seconds the antiscalant pump has been
+   * considered ON today.
+   */
   secondsOn: 0,
+
+  /**
+   * Total millilitres dosed today.
+   */
   mlDosed: 0,
+
+  /**
+   * Whether today's one-time prime has already been counted.
+   */
   primedToday: false,
+
+  /**
+   * Last known PLC pump state.
+   */
   lastOnState: false,
-  lastOnAt: null,     // ms epoch — only meaningful while lastOnState is true
+
+  /**
+   * Timestamp associated with the last ON accounting point.
+   *
+   * This is used to calculate elapsed dosing time between
+   * PLC reports.
+   */
+  lastOnAt: null,
+
+  /**
+   * Timestamp of the last successful persistence operation.
+   */
+  lastFlushedAt: 0,
+
+  /**
+   * Indicates whether state has successfully been restored
+   * from PostgreSQL.
+   */
   hydrated: false,
 };
 
-let flushing = false;
-let flushQueued = false;
 
-// ── Persistence ──────────────────────────────────────────────────────────
+// ============================================================
+// HYDRATION
+// ============================================================
 
+let hydrationPromise = null;
+
+/**
+ * Return the current plant-local date as YYYY-MM-DD.
+ */
+function dosingDayKey(timestampMs = Date.now()) {
+  const date = new Date(timestampMs);
+
+  // Convert UTC timestamp into plant-local time.
+  const localMs =
+    date.getTime() +
+    PLANT_UTC_OFFSET_MINUTES * 60 * 1000;
+
+  const localDate = new Date(localMs);
+
+  const year = localDate.getUTCFullYear();
+  const month = String(localDate.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(localDate.getUTCDate()).padStart(2, '0');
+
+  return `${year}-${month}-${day}`;
+}
+
+
+/**
+ * Return the current plant-local month as YYYY-MM.
+ */
+function dosingMonthKey(timestampMs = Date.now()) {
+  return dosingDayKey(timestampMs).slice(0, 7);
+}
+
+
+/**
+ * Convert a DB value safely into a number.
+ */
+function toNumber(value, fallback = 0) {
+  const number = Number(value);
+
+  return Number.isFinite(number) ? number : fallback;
+}
+
+
+/**
+ * Convert DB timestamp / timestamp-like value into milliseconds.
+ */
+function toTimestampMs(value) {
+  if (!value) return null;
+
+  const timestamp = new Date(value).getTime();
+
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+
+/**
+ * Restore today's dosing state from PostgreSQL.
+ *
+ * IMPORTANT:
+ * This function is called once and shared through hydrationPromise
+ * so multiple PLC/API requests cannot race multiple hydrations.
+ */
 async function hydrate() {
-  const day = dosingDayKey();
-  const existing = await getDosingTotalsForDay(day);
-  if (existing) {
-    state.id = existing.id;
-    state.day = existing.day;
-    state.month = existing.month;
-    state.secondsOn = Number(existing.secondsOn) || 0;
-    state.mlDosed = Number(existing.mlDosed) || 0;
-    state.primedToday = Boolean(existing.primedToday);
-    state.lastOnState = Boolean(existing.lastOnState);
-    state.lastOnAt = existing.lastOnAt ? new Date(existing.lastOnAt).getTime() : null;
-  } else {
-    state.id = null;
-    state.day = day;
-    state.month = dosingMonthKey();
-    state.secondsOn = 0;
-    state.mlDosed = 0;
-    state.primedToday = false;
-    state.lastOnState = false;
-    state.lastOnAt = null;
-  }
-  state.hydrated = true;
-  console.log('[dosing] hydrated', {
-    day: state.day,
-    secondsOn: state.secondsOn,
-    mlDosed: state.mlDosed,
-    primedToday: state.primedToday,
-  });
-}
-
-async function flush() {
-  if (flushing) { flushQueued = true; return; }
-  flushing = true;
-  try {
-    const saved = await upsertDosingTotals({
-      id: state.id,
-      day: state.day,
-      month: state.month,
-      secondsOn: state.secondsOn,
-      mlDosed: state.mlDosed,
-      primedToday: state.primedToday,
-      lastOnState: state.lastOnState,
-      lastOnAt: state.lastOnAt ? new Date(state.lastOnAt) : null,
-    });
-    state.id = saved.id;
-  } catch (err) {
-    console.error('[dosing] flush failed:', err.message);
-  } finally {
-    flushing = false;
-    if (flushQueued) {
-      flushQueued = false;
-      flush();
-    }
-  }
-}
-
-// ── Day rollover ─────────────────────────────────────────────────────────
-
-function rolloverIfNeeded() {
   const today = dosingDayKey();
-  if (state.day === today) return false;
-  // Snapshot old day for later queries (it's already in the DB from flush),
-  // then reset for the new day.
-  console.log('[dosing] day rollover', { from: state.day, to: today });
+  const month = today.slice(0, 7);
+
+  try {
+    const row = await getDosingTotalsForDay(today);
+
+    if (row) {
+      state.id = row.id ?? null;
+
+      state.day = row.day ?? today;
+      state.month = row.month ?? month;
+
+      state.secondsOn = toNumber(row.secondsOn);
+      state.mlDosed = toNumber(row.mlDosed);
+
+      state.primedToday = Boolean(row.primedToday);
+      state.lastOnState = Boolean(row.lastOnState);
+
+      state.lastOnAt = toTimestampMs(row.lastOnAt);
+    } else {
+      /**
+       * No row exists for today.
+       *
+       * This is a genuine new day / first run for today.
+       */
+      state.id = null;
+
+      state.day = today;
+      state.month = month;
+
+      state.secondsOn = 0;
+      state.mlDosed = 0;
+
+      state.primedToday = false;
+
+      state.lastOnState = false;
+      state.lastOnAt = null;
+    }
+
+    state.lastFlushedAt = Date.now();
+    state.hydrated = true;
+
+    console.log(
+      `[dosing] hydrated day=${state.day} ` +
+      `secondsOn=${state.secondsOn.toFixed(2)} ` +
+      `mlDosed=${state.mlDosed.toFixed(3)} ` +
+      `primedToday=${state.primedToday} ` +
+      `lastOnState=${state.lastOnState}`
+    );
+
+    return state;
+  } catch (error) {
+    console.error(
+      '[dosing] failed to hydrate dosing totals:',
+      error
+    );
+
+    /**
+     * Do NOT mark the state as hydrated when the database read
+     * failed. This prevents a temporary DB failure from being
+     * mistaken for a genuine zero-total day.
+     */
+    throw error;
+  }
+}
+
+
+/**
+ * Make sure hydration has completed before anyone reads or
+ * modifies the dosing state.
+ */
+async function ensureHydrated() {
+  if (state.hydrated) {
+    return state;
+  }
+
+  if (!hydrationPromise) {
+    hydrationPromise = hydrate()
+      .catch((error) => {
+        hydrationPromise = null;
+        throw error;
+      });
+  }
+
+  await hydrationPromise;
+
+  return state;
+}
+
+
+// ============================================================
+// DAY ROLLOVER
+// ============================================================
+
+/**
+ * Check whether the plant-local calendar day has changed.
+ *
+ * The previous day's total is already persisted in PostgreSQL.
+ * We therefore start the new day's counters at zero.
+ *
+ * We deliberately preserve the last pump state across midnight.
+ *
+ * Example:
+ *
+ * Pump ON at 23:59:58
+ * Midnight occurs
+ * Pump remains ON
+ *
+ * The next PLC report can continue accounting without requiring
+ * a false OFF -> ON transition.
+ */
+function rolloverIfNeeded(timestampMs = Date.now()) {
+  const today = dosingDayKey(timestampMs);
+  const month = today.slice(0, 7);
+
+  if (!state.day) {
+    state.day = today;
+    state.month = month;
+
+    return false;
+  }
+
+  if (state.day === today) {
+    return false;
+  }
+
+  console.log(
+    `[dosing] day rollover ${state.day} -> ${today}; ` +
+    `resetting today's counters`
+  );
+
   state.id = null;
+
   state.day = today;
-  state.month = dosingMonthKey();
+  state.month = month;
+
   state.secondsOn = 0;
   state.mlDosed = 0;
+
   state.primedToday = false;
-  // lastOnState survives — if the pump was ON at midnight, it's still ON
+
+  /**
+   * IMPORTANT:
+   * Keep lastOnState and lastOnAt.
+   *
+   * If the pump is physically still ON at midnight, we don't
+   * want to create a fake OFF -> ON transition.
+   */
   return true;
 }
 
-// ── Public API ───────────────────────────────────────────────────────────
 
-function toBool(raw) {
-  if (raw === true || raw === 1 || raw === '1') return true;
-  if (raw === false || raw === 0 || raw === '0') return false;
-  if (typeof raw === 'string') {
-    const s = raw.trim().toUpperCase();
-    return s === 'ON' || s === 'TRUE' || s === 'RUNNING' || s === 'ACTIVE' || s === 'YES';
-  }
-  return false;
-}
+// ============================================================
+// DATABASE PERSISTENCE
+// ============================================================
+
+let flushInProgress = false;
+let flushQueued = false;
+
 
 /**
- * Called by plcService on every PLC report of AntiscalantDosingActive.
- * @param {('ON'|'OFF'|1|0|boolean)} rawValue
- * @param {number} [timestampMs]
+ * Persist the current state to PostgreSQL.
+ *
+ * Uses upsertDosingTotals(), which updates the row for the
+ * current plant-local day.
  */
-function recordDosingState(rawValue, timestampMs = Date.now()) {
+async function flush() {
   if (!state.hydrated) {
-    hydrate().then(() => recordDosingState(rawValue, timestampMs))
-      .catch((err) => console.error('[dosing] hydrate failed:', err.message));
     return;
   }
 
-  const rolled = rolloverIfNeeded();
-  const isOn = toBool(rawValue);
-
-  // Rising edge → prime (once per day)
-  if (!state.lastOnState && isOn && !state.primedToday) {
-    state.secondsOn += 1;
-    state.mlDosed += DOSING_RATE_ML_PER_SEC;
-    state.primedToday = true;
-    console.log('[dosing] prime applied for', state.day);
+  if (!state.day) {
+    return;
   }
 
-  // Continuous accrual while ON: credit elapsed wall-clock time since the
-  // last ON report. This handles both the case where the PLC reports every
-  // second and the case where it only sends edge transitions.
-  if (isOn) {
-    if (state.lastOnAt !== null) {
-      const gapSec = Math.min((timestampMs - state.lastOnAt) / 1000, MAX_GAP_SEC);
-      if (gapSec > 0) {
-        state.secondsOn += gapSec;
-        state.mlDosed += gapSec * DOSING_RATE_ML_PER_SEC;
-      }
+  /**
+   * If another flush is currently running, don't start another
+   * DB operation concurrently.
+   *
+   * Instead, remember that another flush is needed.
+   */
+  if (flushInProgress) {
+    flushQueued = true;
+    return;
+  }
+
+  flushInProgress = true;
+
+  try {
+    await upsertDosingTotals({
+      id: state.id,
+      day: state.day,
+      month: state.month,
+
+      secondsOn: state.secondsOn,
+      mlDosed: state.mlDosed,
+
+      primedToday: state.primedToday,
+
+      lastOnState: state.lastOnState,
+
+      /**
+       * Convert milliseconds back into a Date for PostgreSQL.
+       */
+      lastOnAt: state.lastOnAt
+        ? new Date(state.lastOnAt)
+        : null,
+    });
+
+    state.lastFlushedAt = Date.now();
+
+    console.log(
+      `[dosing] persisted day=${state.day} ` +
+      `secondsOn=${state.secondsOn.toFixed(2)} ` +
+      `mlDosed=${state.mlDosed.toFixed(3)}`
+    );
+  } catch (error) {
+    /**
+     * Do NOT reset the in-memory counter if persistence fails.
+     *
+     * The PLC can continue reporting and the service can retry
+     * persistence later.
+     */
+    console.error(
+      '[dosing] failed to persist dosing totals:',
+      error
+    );
+  } finally {
+    flushInProgress = false;
+
+    if (flushQueued) {
+      flushQueued = false;
+
+      /**
+       * Persist the latest state asynchronously.
+       */
+      setImmediate(() => {
+        flush().catch((error) => {
+          console.error(
+            '[dosing] queued flush failed:',
+            error
+          );
+        });
+      });
     }
-    state.lastOnAt = timestampMs;
-  } else {
-    state.lastOnAt = null;
   }
-
-  state.lastOnState = isOn;
-
-  // Persist. Every edge change is written; during long ON periods, throttle
-  // to one write per ~5 s so we don't hammer the DB on a fast PLC.
-  const shouldFlush = rolled
-    || state.lastOnAt === timestampMs   // just got a fresh ON report
-    || !isOn;                            // falling edge — always write
-
-  if (shouldFlush) flush();
 }
 
-function getTodayTotals() {
+
+/**
+ * Decide whether the current state should be persisted.
+ */
+function shouldFlush(force = false) {
+  if (force) {
+    return true;
+  }
+
+  if (!state.lastFlushedAt) {
+    return true;
+  }
+
+  return (
+    Date.now() - state.lastFlushedAt >= FLUSH_INTERVAL_MS
+  );
+}
+
+
+// ============================================================
+// PLC STATE PROCESSING
+// ============================================================
+
+/**
+ * Convert PLC input into a boolean pump state.
+ *
+ * Handles common representations:
+ *
+ * true / false
+ * 1 / 0
+ * "1" / "0"
+ * "true" / "false"
+ * "on" / "off"
+ * "yes" / "no"
+ */
+function normalizeOnState(rawValue) {
+  if (typeof rawValue === 'boolean') {
+    return rawValue;
+  }
+
+  if (typeof rawValue === 'number') {
+    return rawValue !== 0;
+  }
+
+  if (typeof rawValue === 'string') {
+    const value = rawValue.trim().toLowerCase();
+
+    if (
+      value === '1' ||
+      value === 'true' ||
+      value === 'on' ||
+      value === 'yes'
+    ) {
+      return true;
+    }
+
+    if (
+      value === '0' ||
+      value === 'false' ||
+      value === 'off' ||
+      value === 'no' ||
+      value === ''
+    ) {
+      return false;
+    }
+  }
+
+  /**
+   * Unknown values are treated as OFF.
+   *
+   * This is safer than counting dosing for an invalid PLC value.
+   */
+  return false;
+}
+
+
+/**
+ * Record an antiscalant pump PLC state.
+ *
+ * This function is called by plcService.js.
+ *
+ * It does NOT depend on:
+ * - browser connection
+ * - dashboard login
+ * - dashboard logout
+ * - frontend polling
+ *
+ * The PLC is therefore able to continue accumulating totals
+ * even when no user is logged into the dashboard.
+ */
+async function recordDosingState(
+  rawValue,
+  timestampMs = Date.now()
+) {
+  try {
+    /**
+     * Never process PLC state against an unhydrated zero state.
+     */
+    await ensureHydrated();
+
+    /**
+     * Check whether the calendar day has changed.
+     */
+    const rolled = rolloverIfNeeded(timestampMs);
+
+    const isOn = normalizeOnState(rawValue);
+
+    /**
+     * If the pump has just transitioned OFF -> ON,
+     * count the initial one-second prime once per day.
+     */
+    const risingEdge =
+      !state.lastOnState &&
+      isOn;
+
+    if (risingEdge) {
+      if (!state.primedToday) {
+        state.secondsOn += 1;
+
+        state.mlDosed +=
+          DOSING_RATE_ML_PER_SEC;
+
+        state.primedToday = true;
+
+        console.log(
+          `[dosing] prime counted: ` +
+          `${DOSING_RATE_ML_PER_SEC.toFixed(3)} ml`
+        );
+      }
+
+      /**
+       * Start timing from this PLC ON event.
+       */
+      state.lastOnAt = timestampMs;
+    }
+
+    /**
+     * Pump is ON.
+     */
+    if (isOn) {
+      /**
+       * If this is not a rising edge, calculate elapsed time
+       * since the previous ON accounting point.
+       */
+      if (
+        !risingEdge &&
+        state.lastOnAt !== null
+      ) {
+        let elapsedSec =
+          (timestampMs - state.lastOnAt) / 1000;
+
+        /**
+         * Protect against:
+         * - duplicate timestamps
+         * - clock changes
+         * - negative elapsed values
+         * - very large PLC/backend gaps
+         */
+        if (!Number.isFinite(elapsedSec)) {
+          elapsedSec = 0;
+        }
+
+        elapsedSec = Math.max(0, elapsedSec);
+
+        elapsedSec = Math.min(
+          elapsedSec,
+          MAX_GAP_SEC
+        );
+
+        if (elapsedSec > 0) {
+          state.secondsOn += elapsedSec;
+
+          state.mlDosed +=
+            elapsedSec *
+            DOSING_RATE_ML_PER_SEC;
+        }
+      }
+
+      /**
+       * Move the accounting point to this PLC report.
+       */
+      state.lastOnAt = timestampMs;
+    }
+
+    /**
+     * Pump is OFF.
+     */
+    else {
+      /**
+       * If the pump was previously ON, the final ON interval
+       * has already been accounted for by the preceding PLC
+       * report. We now close the ON interval.
+       */
+      state.lastOnAt = null;
+    }
+
+    /**
+     * Remember the latest PLC state.
+     */
+    state.lastOnState = isOn;
+
+    /**
+     * Persist:
+     *
+     * - immediately after a rollover
+     * - when pump switches OFF
+     * - approximately every 5 seconds while running
+     */
+    const forceFlush =
+      rolled ||
+      !isOn;
+
+    if (forceFlush || shouldFlush()) {
+      await flush();
+    }
+
+    return getStateSnapshot();
+  } catch (error) {
+    console.error(
+      '[dosing] recordDosingState failed:',
+      error
+    );
+
+    /**
+     * Do not throw into the PLC polling loop unless the caller
+     * specifically needs the exception.
+     *
+     * Returning the current state keeps the PLC service alive.
+     */
+    return getStateSnapshot();
+  }
+}
+
+
+// ============================================================
+// API / READ METHODS
+// ============================================================
+
+/**
+ * Return a safe copy of the current state.
+ *
+ * This prevents callers from directly modifying the internal
+ * state object.
+ */
+function getStateSnapshot() {
   return {
+    id: state.id,
+
     day: state.day,
     month: state.month,
+
     secondsOn: state.secondsOn,
     mlDosed: state.mlDosed,
+
     primedToday: state.primedToday,
-    rateMlPerSec: DOSING_RATE_ML_PER_SEC,
-    rateMlPerMin: DOSING_RATE_ML_PER_SEC * 60,
+
+    lastOnState: state.lastOnState,
+
+    lastOnAt: state.lastOnAt
+      ? new Date(state.lastOnAt).toISOString()
+      : null,
+
+    hydrated: state.hydrated,
   };
 }
 
-async function getMonthSummary() {
-  return getDosingCurrentMonthTotal();
+
+/**
+ * Return today's total.
+ *
+ * IMPORTANT:
+ * This waits for database hydration before returning.
+ *
+ * This prevents a newly started Node process from answering
+ * the dashboard with:
+ *
+ *     mlDosed: 0
+ *
+ * while PostgreSQL is still being read.
+ */
+async function getTodayTotals() {
+  await ensureHydrated();
+
+  rolloverIfNeeded();
+
+  return getStateSnapshot();
 }
 
-// Hydrate on module load.
-hydrate().catch((err) => console.error('[dosing] initial hydrate failed:', err.message));
+
+/**
+ * Return monthly summary from the existing database layer.
+ *
+ * The database function remains responsible for the monthly
+ * aggregation.
+ */
+async function getMonthSummary() {
+  await ensureHydrated();
+
+  return getMonthSummaryFromDatabase();
+}
+
+
+/**
+ * Wrapper kept separate so the database import can be changed
+ * in one place if required by the existing postgres.js API.
+ */
+async function getMonthSummaryFromDatabase() {
+  /**
+   * The existing project already has a database function for
+   * the current month total.
+   *
+   * We intentionally require it lazily here so that the rest of
+   * the dosing service remains compatible with the existing
+   * postgres.js module.
+   */
+  const postgres = require('../database/postgres');
+
+  if (
+    typeof postgres.getDosingCurrentMonthTotal ===
+    'function'
+  ) {
+    return postgres.getDosingCurrentMonthTotal();
+  }
+
+  /**
+   * If the existing application expects another month-summary
+   * function, return the in-memory month information rather than
+   * crashing the dosing service.
+   */
+  return {
+    month: state.month,
+    secondsOn: state.secondsOn,
+    mlDosed: state.mlDosed,
+  };
+}
+
+
+// ============================================================
+// STARTUP
+// ============================================================
+
+/**
+ * Start hydration immediately when the module loads.
+ *
+ * The promise is retained so API/PLC calls can await the same
+ * hydration operation.
+ */
+hydrationPromise = hydrate()
+  .catch((error) => {
+    console.error(
+      '[dosing] startup hydration failed:',
+      error
+    );
+
+    /**
+     * Allow a later API/PLC request to retry hydration.
+     */
+    hydrationPromise = null;
+
+    throw error;
+  });
+
+
+// ============================================================
+// EXPORTS
+// ============================================================
 
 module.exports = {
+  DOSING_RATE_ML_PER_SEC,
+  MAX_GAP_SEC,
+
   recordDosingState,
+
   getTodayTotals,
   getMonthSummary,
-  DOSING_RATE_ML_PER_SEC,
+
+  /**
+   * Exported mainly for diagnostics/testing.
+   */
+  ensureHydrated,
+  hydrate,
+
+  /**
+   * Useful for debugging without exposing the mutable object.
+   */
+  getStateSnapshot,
 };

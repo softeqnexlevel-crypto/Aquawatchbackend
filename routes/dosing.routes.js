@@ -22,14 +22,19 @@ const { getDosingHistoryForMonth } = require('../database/postgres');
 
 // Today's running total. Cheap — reads from the in-memory cache in
 // dosingService. Safe to poll every few seconds.
-router.get('/totals', /* requireAuth, */ (req, res) => {
+router.get('/totals', async (req, res) => {
   try {
-    res.json(getTodayTotals());
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    const totals = await getTodayTotals();
+
+    res.json(totals);
+  } catch (error) {
+    console.error('[dosing] GET /totals failed:', error);
+
+    res.status(500).json({
+      error: 'Failed to get dosing totals',
+    });
   }
 });
-
 // Current month's aggregate (sum across all day rows).
 router.get('/month', /* requireAuth, */ async (req, res) => {
   try {
