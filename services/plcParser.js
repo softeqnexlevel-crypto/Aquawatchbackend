@@ -15,6 +15,27 @@ const ARCHIVE_RAW_FAILED = Boolean(process.env.ARCHIVE_RAW_FAILED && process.env
 const CALIBRATION_FILE = process.env.CALIBRATION_FILE || path.resolve(__dirname, '..', 'data', 'calibration.json');
 const MIN_VALID_ABS_VALUE = Number(process.env.MIN_VALID_ABS_VALUE) || 1e-6;
 
+// ── Feed tank level calibration ──────────────────────────────────────────
+// Was previously a flat `rawValue * 7.83` factor, which does NOT match the
+// transmitter's actual calibration curve. The correct curve (per the Abox
+// Calibrator tool used to characterize this sensor) is a two-point linear
+// mapping: raw 4.9 -> 10%, raw 10.0 -> 100%. Kept env-overridable so a
+// future re-calibration (new transmitter, recalibrated range, etc.) is a
+// config change, not a code deploy.
+const FEED_TANK_RAW_MIN = Number(process.env.FEED_TANK_RAW_MIN) || 4.9;
+const FEED_TANK_RAW_MAX = Number(process.env.FEED_TANK_RAW_MAX) || 10.0;
+const FEED_TANK_PCT_MIN = Number(process.env.FEED_TANK_PCT_MIN) || 10;
+const FEED_TANK_PCT_MAX = Number(process.env.FEED_TANK_PCT_MAX) || 100;
+
+function feedTankRawToPercent(raw) {
+  if (!Number.isFinite(raw)) return NaN;
+  const clamped = Math.min(FEED_TANK_RAW_MAX, Math.max(FEED_TANK_RAW_MIN, raw));
+  return (
+    FEED_TANK_PCT_MIN +
+    ((clamped - FEED_TANK_RAW_MIN) * (FEED_TANK_PCT_MAX - FEED_TANK_PCT_MIN)) /
+      (FEED_TANK_RAW_MAX - FEED_TANK_RAW_MIN)
+  );
+}
 
 const DEBUG_LOG_FILE = path.resolve(__dirname, '..', 'debug.log');
 
@@ -405,9 +426,14 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
   if (parameter === 'RO5-FeedTankLevel' || parameter === 'FeedTankLevel' ||
       parameter === 'FT-A' || parameter === 'FeedTank') {
     const rawValue = measurement.value;
-    const scaledValue = rawValue * 7.83;
+    // ✅ FIXED: was `rawValue * 7.83`, a flat factor that did not match
+    // this transmitter's actual calibration curve (4.9 -> 10%, 10.0 ->
+    // 100%, per the Abox Calibrator tool). Now uses the same two-point
+    // linear mapping the frontend uses, so backend and frontend always
+    // agree on this value.
+    const scaledValue = feedTankRawToPercent(rawValue);
 
-    console.log(`[plc] 📊 Feed Tank: Raw=${rawValue} → Scaled=${scaledValue}%`);
+    console.log(`[plc] 📊 Feed Tank: Raw=${rawValue} → Scaled=${scaledValue.toFixed(2)}%`);
 
     const scaledRecord = {
       topic,
@@ -417,13 +443,27 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       timestamp: measurement.timestamp || new Date().toISOString(),
       simulated: !!measurement.simulated,
       dataType: 'float',
-      debug: { ...measurement.debug, rawValue, scaledValue, scaleFactor: 7.83 }
+      debug: {
+        ...measurement.debug,
+        rawValue,
+        scaledValue,
+        calibration: {
+          rawMin: FEED_TANK_RAW_MIN,
+          rawMax: FEED_TANK_RAW_MAX,
+          pctMin: FEED_TANK_PCT_MIN,
+          pctMax: FEED_TANK_PCT_MAX,
+        },
+      },
     };
 
     const rawRecord = {
       topic,
       parameter: 'RO5-FeedTankLevelRaw',
-      unit: '%',
+      // ✅ FIXED: was mislabeled '%' even though this is the raw,
+      // uncalibrated transmitter signal (range ~4.9-10.0), not a
+      // percentage. Left blank; the frontend's SENSOR_MAP/getUnitForParameter
+      // is the source of truth for how this is labeled in the UI.
+      unit: '',
       value: rawValue,
       timestamp: measurement.timestamp || new Date().toISOString(),
       simulated: !!measurement.simulated,
@@ -641,5 +681,5 @@ module.exports = {
   getLatestSnapshot,
   getLatestFull,
   getCalibration,
-  _internal: { peelHexLayers, parseNamedRecords, hexdump }
+  _internal: { peelHexLayers, parseNamedRecords, hexdump, feedTankRawToPercent }
 };
