@@ -16,15 +16,15 @@ const CALIBRATION_FILE = process.env.CALIBRATION_FILE || path.resolve(__dirname,
 const MIN_VALID_ABS_VALUE = Number(process.env.MIN_VALID_ABS_VALUE) || 1e-6;
 
 // ── Feed tank level calibration ──────────────────────────────────────────
-// Matches frontend/components/dashboardComponents/feedTankCalibration.js:
-//   raw 4.9  -> 0%
-//   raw 10.0 -> 100%
-// The frontend also runs its own calibration from RO5-FeedTankLevelRaw, so
-// this backend value is a fallback only. Kept here so backend and frontend
-// agree when the raw tag hasn't arrived yet.
+// Was previously a flat `rawValue * 7.83` factor, which does NOT match the
+// transmitter's actual calibration curve. The correct curve (per the Abox
+// Calibrator tool used to characterize this sensor) is a two-point linear
+// mapping: raw 4.9 -> 10%, raw 10.0 -> 100%. Kept env-overridable so a
+// future re-calibration (new transmitter, recalibrated range, etc.) is a
+// config change, not a code deploy.
 const FEED_TANK_RAW_MIN = Number(process.env.FEED_TANK_RAW_MIN) || 4.9;
 const FEED_TANK_RAW_MAX = Number(process.env.FEED_TANK_RAW_MAX) || 10.0;
-const FEED_TANK_PCT_MIN = Number(process.env.FEED_TANK_PCT_MIN) || 0;
+const FEED_TANK_PCT_MIN = Number(process.env.FEED_TANK_PCT_MIN) || 10;
 const FEED_TANK_PCT_MAX = Number(process.env.FEED_TANK_PCT_MAX) || 100;
 
 function feedTankRawToPercent(raw) {
@@ -46,6 +46,7 @@ function dlog(...args) {
       .join(' ')}\n`;
     fs.appendFileSync(DEBUG_LOG_FILE, line);
   } catch (err) {
+    // Never let logging crash the app
     console.error('[dlog] failed to write debug log:', err && err.message ? err.message : err);
   }
 }
@@ -53,75 +54,18 @@ function dlog(...args) {
 const latest = {};
 let dataCount = 0;
 
-// ── Parameter alias map ─────────────────────────────────────────────────
-// Translates raw PLC tag names to the RO5- prefixed keys the frontend
-// expects. Add new aliases here if you see a new name in debug.log.
-const PARAMETER_ALIASES = {
-  // System status
-  'SystemActive': 'RO5-SystemActive',
-  'System_Active': 'RO5-SystemActive',
-  'SysActive': 'RO5-SystemActive',
-  'SysOn': 'RO5-SystemActive',
-  'MasterOn': 'RO5-SystemActive',
-  'RunBit': 'RO5-SystemActive',
-  'RO5-SystemActive': 'RO5-SystemActive',
+// ── Alert notifications (email to users + Slack + calendar) ──────────────
+// Runs the shared alert engine against `latest` and notifies when an alert
+// turns active. Never throws: if it can't start it logs why and the rest of
+// the backend carries on. See services/notifications/README.md.
+const { startAlertNotifier } = require('./notifications');
+let alertNotifier = null;
+startAlertNotifier({
+  getValue: (key) => (latest[key] ? latest[key].value : undefined),
+}).then((n) => { alertNotifier = n; });
 
-  'SystemOperation': 'RO5-SystemOperation',
-  'System_Operation': 'RO5-SystemOperation',
-  'RO5-SystemOperation': 'RO5-SystemOperation',
-
-  'SystemMode': 'RO5-SystemMode',
-  'System_Mode': 'RO5-SystemMode',
-  'Mode': 'RO5-SystemMode',
-  'RO5-SystemMode': 'RO5-SystemMode',
-
-  // Antiscalant
-  'AntiscalantDoser': 'RO5-AntiscalantDosingActive',
-  'AntiscalantDosingActive': 'RO5-AntiscalantDosingActive',
-  'DosingActive': 'RO5-AntiscalantDosingActive',
-  'Doser': 'RO5-AntiscalantDosingActive',
-  'Dosing': 'RO5-AntiscalantDosingActive',
-  'Antiscalant': 'RO5-AntiscalantDosingActive',
-  'RO5-AntiscalantDosingActive': 'RO5-AntiscalantDosingActive',
-
-  // Feed tank
-  'RO5-FeedTankLevel': 'RO5-FeedTankLevel',
-  'FeedTankLevel': 'RO5-FeedTankLevel',
-  'FT-A': 'RO5-FeedTankLevel',
-  'FeedTank': 'RO5-FeedTankLevel',
-};
-
-// Parameters that should always be coerced to 'ON'/'OFF'.
-const BIT_PARAMETERS = new Set([
-  'RO5-SystemActive',
-  'RO5-SystemOperation',
-  'RO5-AntiscalantDosingActive',
-  'RO5-Feedpump',
-  'RO5-PrefilterBackwash',
-  'RO5-HighPrefilterDeltaP',
-]);
-
-function normalizeParameterName(rawName) {
-  if (!rawName || typeof rawName !== 'string') return rawName;
-  const trimmed = rawName.trim();
-  return PARAMETER_ALIASES[trimmed] || trimmed;
-}
-
-function coerceBitValue(value) {
-  if (value === 1 || value === '1' || value === 1.0 || value === 'ON' ||
-      value === 'on' || value === true || value === 'TRUE' || value === 'true' ||
-      value === 'Running') {
-    return 'ON';
-  }
-  if (value === 0 || value === '0' || value === 0.0 || value === 'OFF' ||
-      value === 'off' || value === false || value === 'FALSE' || value === 'false' ||
-      value === 'Stopped') {
-    return 'OFF';
-  }
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value > 0.5 ? 'ON' : 'OFF';
-  }
-  return value;
+function notifyTag(record) {
+  if (alertNotifier && record && !record.simulated) alertNotifier.onTag();
 }
 
 const DB_SAMPLE_INTERVAL_MS = Number(process.env.DB_SAMPLE_INTERVAL_MS) || 30000;
@@ -242,6 +186,7 @@ function parseNamedRecords(buf) {
         value = buf[i + 13] || 0;
         dataType = 'bit';
       } else {
+
         dlog('SKIPPED-UNHANDLED-LEN', { offset: i, recordIndex, typeByte, lenByte });
         continue;
       }
@@ -275,6 +220,9 @@ function parseNamedRecords(buf) {
     }
 
     if (!parsed) {
+      // Always writes to debug.log via dlog(), plus a small hexdump
+      // slice around the failed record so we can inspect the actual bytes
+      // without needing to re-run with DEBUG_PARSE or fight shell redirects.
       const sliceStart = Math.max(0, i);
       const sliceEnd = Math.min(buf.length, nextMarker);
       const rawSlice = buf.slice(sliceStart, sliceEnd);
@@ -292,6 +240,9 @@ function parseNamedRecords(buf) {
       continue;
     }
 
+    // Log every successfully resolved record so we can confirm
+    // exactly which parameter names come out of the parser each cycle,
+    // and cross-check whether "AntiscalantDoser" appears here at all.
     dlog('RESOLVED', { offset: i, recordIndex, name: parsed.name, unit: parsed.unit, value, dataType });
 
     records.push({
@@ -307,6 +258,8 @@ function parseNamedRecords(buf) {
     });
   }
 
+  // Summary line per payload — markers found vs records resolved.
+  // If these numbers don't match, records are being silently dropped.
   dlog('SUMMARY', { markersFound: markers.length, recordsResolved: records.length });
 
   return records;
@@ -462,26 +415,21 @@ function recordToDB(record) {
 function processMeasurement(topic, measurement, idx, rawBuf) {
   let parameter = measurement.parameter || parameterFromTopic(topic) || null;
 
-  // ── Step 1: normalize alias -> canonical RO5- name ──────────────────
-  const beforeNormalize = parameter;
-  parameter = normalizeParameterName(parameter);
-  if (beforeNormalize !== parameter) {
-    dlog('PARAM-NORMALIZED', { from: beforeNormalize, to: parameter, topic });
+  if (parameter === 'AntiscalantDoser' || parameter === 'DosingActive' ||
+      parameter === 'Doser' || parameter === 'Dosing' || parameter === 'Antiscalant') {
+    // Log every time an antiscalant alias is recognized here, so we
+    // can confirm processMeasurement is actually being reached for it.
+    dlog('ANTISCALANT-ALIAS-MATCHED', { originalParameter: parameter, topic, value: measurement.value });
+    parameter = 'AntiscalantDosingActive';
   }
 
-  // ── Step 2: coerce bit-valued parameters to 'ON'/'OFF' ──────────────
-  if (BIT_PARAMETERS.has(parameter)) {
-    const coerced = coerceBitValue(measurement.value);
-    if (coerced !== measurement.value) {
-      dlog('BIT-COERCED', { parameter, from: measurement.value, to: coerced });
-    }
-    measurement.value = coerced;
-    measurement.dataType = 'bit';
-    measurement.unit = '';
-  }
-
-  // ── Step 3: antiscalant side-effect (dosing totalizer) ──────────────
-  if (parameter === 'RO5-AntiscalantDosingActive') {
+  // ── Feed the server-side dosing totalizer ────────────────────────────
+  // Runs on every PLC report of the dosing bit, whether or not any browser
+  // is connected. This is the single source of truth for "how much
+  // antiscalant has been dosed today". The value may be 'ON'/'OFF' (already
+  // normalized by handleIncoming) or a raw 1/0 — recordDosingState handles
+  // all forms.
+  if (parameter === 'AntiscalantDosingActive') {
     try {
       recordDosingState(measurement.value, Date.now());
     } catch (err) {
@@ -489,9 +437,14 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     }
   }
 
-  // ── Step 4: feed tank special handling ──────────────────────────────
-  if (parameter === 'RO5-FeedTankLevel') {
+  if (parameter === 'RO5-FeedTankLevel' || parameter === 'FeedTankLevel' ||
+      parameter === 'FT-A' || parameter === 'FeedTank') {
     const rawValue = measurement.value;
+    // ✅ FIXED: was `rawValue * 7.83`, a flat factor that did not match
+    // this transmitter's actual calibration curve (4.9 -> 10%, 10.0 ->
+    // 100%, per the Abox Calibrator tool). Now uses the same two-point
+    // linear mapping the frontend uses, so backend and frontend always
+    // agree on this value.
     const scaledValue = feedTankRawToPercent(rawValue);
 
     console.log(`[plc] 📊 Feed Tank: Raw=${rawValue} → Scaled=${scaledValue.toFixed(2)}%`);
@@ -520,6 +473,10 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     const rawRecord = {
       topic,
       parameter: 'RO5-FeedTankLevelRaw',
+      // ✅ FIXED: was mislabeled '%' even though this is the raw,
+      // uncalibrated transmitter signal (range ~4.9-10.0), not a
+      // percentage. Left blank; the frontend's SENSOR_MAP/getUnitForParameter
+      // is the source of truth for how this is labeled in the UI.
       unit: '',
       value: rawValue,
       timestamp: measurement.timestamp || new Date().toISOString(),
@@ -530,6 +487,9 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
 
     latest[scaledRecord.parameter] = scaledRecord;
     latest[rawRecord.parameter] = rawRecord;
+
+    // Alert notifier: wake it up now that fresh feed-tank values are stored
+    notifyTag(scaledRecord);
 
     broadcast('plc-data', scaledRecord);
     broadcast('plc-data', rawRecord);
@@ -550,6 +510,7 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
       });
     }
 
+    
     try {
       const alarms = evaluate(scaledRecord.parameter, scaledValue);
       if (alarms && alarms.length) {
@@ -568,8 +529,8 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     return;
   }
 
-  // ── Step 5: generic parameter path ──────────────────────────────────
   if (!isValidParameterName(parameter)) {
+   
     dlog('INVALID-PARAMETER-NAME', { original: parameter, topic });
     parameter = parameterFromTopic(topic) || `unknown_${idx || 'x'}`;
   }
@@ -598,6 +559,9 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     try { broadcast('plc-data', record); } catch (e) {}
     return;
   }
+
+  // Alert notifier: wake it up now that a valid value is stored
+  notifyTag(record);
 
   if (shouldWriteToDb(parameter, record.value, record.dataType)) {
     recordToDB(record).catch((err) => {
@@ -636,6 +600,10 @@ function handleIncoming(topic, raw) {
 
   if (!rawBuf) return;
 
+  // Unconditional raw-payload logging (ASCII form) so we can grep
+  // debug.log for "Antiscalant" and see immediately whether the string
+  // shows up anywhere in what the ABox actually sent, independent of
+  // whether the parser succeeds in extracting it as a record.
   dlog('INCOMING', {
     topic,
     bytes: rawBuf.length,
@@ -648,6 +616,9 @@ function handleIncoming(topic, raw) {
     if (DEBUG_PARSE) console.debug('[plc] decoded hexdump head:\n' + hexdump(decodedBuf, 256));
   }
 
+  // Also log the decoded (post hex-peel) ASCII — this is the buffer
+  // that parseNamedRecords actually scans, so if "Antiscalant" appears in
+  // INCOMING but not here, the hex-peeling step is corrupting/eating it.
   dlog('DECODED', {
     topic,
     layersPeeled,
@@ -685,24 +656,26 @@ function handleIncoming(topic, raw) {
     return;
   }
 
-  // Pre-pass: log the raw name, coerce bits, and record the alias match
-  parsedList.forEach((record) => {
-    const originalParam = record.parameter;
-    const normalized = normalizeParameterName(originalParam);
+ parsedList.forEach((record) => {
+  const isAntiscalant = record.parameter === 'AntiscalantDoser' ||
+                        record.parameter === 'AntiscalantDosingActive' ||
+                        record.parameter === 'DosingActive' ||
+                        record.parameter === 'Doser' ||
+                        record.parameter === 'Dosing' ||
+                        record.parameter === 'Antiscalant';
 
-    if (normalized !== originalParam) {
-      dlog('ALIAS-MATCHED', { rawName: originalParam, normalized, value: record.value, dataType: record.dataType });
-    }
+  if (isAntiscalant || record.dataType === 'bit') {
+    record.value = record.value === 1 ? 'ON' : 'OFF';
+    record.unit = '';
+    record.dataType = 'bit';
+    console.log(`[plc] 🔄 Converted ${record.parameter} to: ${record.value}`);
 
-    if (BIT_PARAMETERS.has(normalized) || record.dataType === 'bit') {
-      const coerced = coerceBitValue(record.value);
-      record.value = coerced;
-      record.unit = '';
-      record.dataType = 'bit';
-      console.log(`[plc] 🔄 Converted ${normalized} to: ${coerced}`);
-      dlog('BIT-CONVERTED', { rawName: originalParam, normalized, value: coerced });
+    if (isAntiscalant) {
+      dlog('ANTISCALANT-BIT-CONVERTED', { originalParameter: record.parameter, value: record.value });
+      record.parameter = 'AntiscalantDosingActive';
     }
-  });
+  }
+});
 
   parsedList.forEach((m, idx) => {
     try {
@@ -728,12 +701,5 @@ module.exports = {
   getLatestSnapshot,
   getLatestFull,
   getCalibration,
-  _internal: {
-    peelHexLayers,
-    parseNamedRecords,
-    hexdump,
-    feedTankRawToPercent,
-    normalizeParameterName,
-    coerceBitValue
-  }
+  _internal: { peelHexLayers, parseNamedRecords, hexdump, feedTankRawToPercent }
 };
