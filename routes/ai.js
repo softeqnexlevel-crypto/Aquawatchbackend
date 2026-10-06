@@ -11,7 +11,7 @@ const MAX_MESSAGE_LENGTH = 2000;
 
 router.post('/chat', authMiddleware.requireAuth, async (req, res) => {
   try {
-    const { message } = req.body || {};
+    const { message, page } = req.body || {};
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ error: 'A non-empty "message" string is required.' });
@@ -20,7 +20,7 @@ router.post('/chat', authMiddleware.requireAuth, async (req, res) => {
       return res.status(400).json({ error: `Message too long (max ${MAX_MESSAGE_LENGTH} characters).` });
     }
 
-    const context = buildSystemContext();
+    const context = await buildSystemContext({ page });
     const provider = getAIProvider();
 
     const reply = await provider.generateResponse(SYSTEM_PROMPT, message.trim(), context);
