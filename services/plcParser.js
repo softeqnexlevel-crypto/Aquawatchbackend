@@ -58,11 +58,11 @@ let dataCount = 0;
 // Runs the shared alert engine against `latest` and notifies when an alert
 // turns active. Never throws: if it can't start it logs why and the rest of
 // the backend carries on. See services/notifications/README.md.
-const { startAlertNotifier } = require('./notifications');
-let alertNotifier = null;
-startAlertNotifier({
-  getValue: (key) => (latest[key] ? latest[key].value : undefined),
-}).then((n) => { alertNotifier = n; });
+// const { startAlertNotifier } = require('./notifications');
+// let alertNotifier = null;
+// startAlertNotifier({
+//   getValue: (key) => (latest[key] ? latest[key].value : undefined),
+// }).then((n) => { alertNotifier = n; });
 
 // function notifyTag(record) {
 //   if (alertNotifier && record && !record.simulated) alertNotifier.onTag();
