@@ -64,9 +64,9 @@ startAlertNotifier({
   getValue: (key) => (latest[key] ? latest[key].value : undefined),
 }).then((n) => { alertNotifier = n; });
 
-function notifyTag(record) {
-  if (alertNotifier && record && !record.simulated) alertNotifier.onTag();
-}
+// function notifyTag(record) {
+//   if (alertNotifier && record && !record.simulated) alertNotifier.onTag();
+// }
 
 const DB_SAMPLE_INTERVAL_MS = Number(process.env.DB_SAMPLE_INTERVAL_MS) || 30000;
 
@@ -489,7 +489,7 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
     latest[rawRecord.parameter] = rawRecord;
 
     // Alert notifier: wake it up now that fresh feed-tank values are stored
-    notifyTag(scaledRecord);
+    // notifyTag(scaledRecord);
 
     broadcast('plc-data', scaledRecord);
     broadcast('plc-data', rawRecord);
@@ -561,7 +561,7 @@ function processMeasurement(topic, measurement, idx, rawBuf) {
   }
 
   // Alert notifier: wake it up now that a valid value is stored
-  notifyTag(record);
+  // notifyTag(record);
 
   if (shouldWriteToDb(parameter, record.value, record.dataType)) {
     recordToDB(record).catch((err) => {
