@@ -14,17 +14,17 @@ const { rawKeysFor } = require('./keyMap');
 const CHANNELS = ['email', 'slack', 'calendar'];
 
 const AUDIT_KEYS = [
-  'RO5-SystemOperation',
-  'RO5-SystemActive',
-  'RO5-SystemMode',
   'RO5-Feedpump',
+  'RO5-HPPpump',
   'RO5-PrefilterBackwash',
+  'RO5-PrefilterBackwashing',
+  'RO5-FeedTankLevel',
   'RO5-ROPressure',
   'RO5-Stage1Delta',
   'RO5-Stage2Delta',
   'RO5-MediaFilterDeltaP',
+  'RO5-MediaFilterInPress',
   'RO5-SystemRecovery',
-  'RO5-FeedTankLevel',
   'RO5-FEEDFlow',
   'RO5-Permeateflow',
   'RO5-ConcetrateFlow',
@@ -62,6 +62,7 @@ class AlertNotifier {
     this._tankEmptyLatched = false;
     this._backwashLatched = false;
     this._lastBackwashMode = null;
+    this._lastDiagLog = 0;
 
     this.state = this.loadState();
   }
@@ -119,69 +120,17 @@ class AlertNotifier {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Simple Tank Empty Notification (independent of the alert engine)
-  // Fires ONE plain email/Slack the moment the tank hits empty in STANDBY.
+  // Tank Empty Notification
+  // Fires once when the tank is empty AND both pumps are off (standby).
+  // Uses only tags your PLC actually sends.
   // ─────────────────────────────────────────────────────────────────────────
 
   maybeNotifyTankEmpty() {
     const tankLevelRaw = this.getValue('RO5-FeedTankLevel');
-    const systemOperationRaw = this.getValue('RO5-SystemOperation');
+    const feedPumpRaw = this.getValue('RO5-Feedpump');
+    const hppPumpRaw = this.getValue('RO5-HPPpump');
 
     const tankLevel = Number(tankLevelRaw);
-
-    const operation = String(systemOperationRaw ?? '')
-      .trim()
-      .toUpperCase();
-
-    const isStandby =
-      operation.includes('STANDBY') ||
-      operation.includes('STAND BY');
-
-    const isEmpty =
-      Number.isFinite(tankLevel) && tankLevel <= 10;
-
-    const shouldFire = isStandby && isEmpty;
-
-    if (shouldFire && !this._tankEmptyLatched) {
-      this._tankEmptyLatched = true;
-
-      channels
-        .sendTankEmptyNotification({
-          startedAt: new Date(),
-          tankLevel,
-          currentMode: operation || undefined,
-        })
-        .catch((err) =>
-          this.log.error?.(
-            `[alert-notifier] tank-empty notification failed: ${err.message}`
-          )
-        );
-    }
-
-    if (!shouldFire && this._tankEmptyLatched) {
-      this._tankEmptyLatched = false;
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Simple Backwash Notification (independent of the alert engine)
-  // Fires ONE plain email/Slack on the rising edge into BACKWASH.
-  // ─────────────────────────────────────────────────────────────────────────
-
-  maybeNotifyBackwash() {
-    const opRaw = this.getValue('RO5-SystemOperation');
-    const modeRaw = this.getValue('RO5-SystemMode');
-    const bwBitRaw = this.getValue('RO5-PrefilterBackwash');
-
-    const normalize = (raw) => {
-      if (raw === undefined || raw === null || raw === '') return 'UNKNOWN';
-      const v = String(raw).trim().toUpperCase();
-      if (v.includes('BACKWASH') || v.includes('BACK WASH')) return 'BACKWASH';
-      if (v.includes('FILTER')) return 'FILTER';
-      if (v.includes('STANDBY') || v.includes('STAND BY')) return 'STANDBY';
-      if (v === 'OFF' || v === 'STOP' || v === 'STOPPED') return 'OFF';
-      return 'UNKNOWN';
-    };
 
     const isOn = (raw) => {
       if (raw === undefined || raw === null) return false;
@@ -189,25 +138,96 @@ class AlertNotifier {
       return v === 'ON' || v === 'TRUE' || v === '1' || v === 'YES';
     };
 
-    let currentMode =
-      normalize(opRaw) !== 'UNKNOWN' ? normalize(opRaw) :
-      normalize(modeRaw) !== 'UNKNOWN' ? normalize(modeRaw) :
-      isOn(bwBitRaw) ? 'BACKWASH' : 'UNKNOWN';
+    // "Standby" = both pumps off.
+    const isStandby = !isOn(feedPumpRaw) && !isOn(hppPumpRaw);
+    const isEmpty = Number.isFinite(tankLevel) && tankLevel <= 30;
+    const shouldFire = isStandby && isEmpty;
 
-    if (currentMode !== 'BACKWASH' && isOn(bwBitRaw)) currentMode = 'BACKWASH';
+    const now = Date.now();
+    if (now - this._lastDiagLog > 3000) {
+      this._lastDiagLog = now;
+      console.log(
+        `[MQTT-TANK] level=${tankLevelRaw} (${tankLevel}), ` +
+        `feedpump=${feedPumpRaw}, hpp=${hppPumpRaw}, ` +
+        `isStandby=${isStandby}, isEmpty=${isEmpty}, ` +
+        `shouldFire=${shouldFire}, latched=${this._tankEmptyLatched}`
+      );
+    }
+
+    if (shouldFire && !this._tankEmptyLatched) {
+      this._tankEmptyLatched = true;
+
+      console.log(
+        `[MQTT-TANK] 🔔 FIRING tank-empty notification (level=${tankLevel}%)`
+      );
+
+      channels
+        .sendTankEmptyNotification({
+          startedAt: new Date(),
+          tankLevel,
+          currentMode: 'STANDBY',
+        })
+        .then(() => console.log('[MQTT-TANK] ✅ notification sent'))
+        .catch((err) =>
+          this.log.error?.(`[MQTT-TANK] ❌ failed: ${err.message}`)
+        );
+    }
+
+    if (!shouldFire && this._tankEmptyLatched) {
+      console.log('[MQTT-TANK] condition cleared — resetting latch');
+      this._tankEmptyLatched = false;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Backwash Notification
+  // Fires once on the rising edge into backwash.
+  // Backwash is detected from RO5-PrefilterBackwash / RO5-PrefilterBackwashing.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  maybeNotifyBackwash() {
+    const bwTagRaw = this.getValue('RO5-PrefilterBackwash');
+    const bwRunningRaw = this.getValue('RO5-PrefilterBackwashing');
+    const feedPumpRaw = this.getValue('RO5-Feedpump');
+    const hppPumpRaw = this.getValue('RO5-HPPpump');
+
+    const isOn = (raw) => {
+      if (raw === undefined || raw === null) return false;
+      const v = String(raw).trim().toUpperCase();
+      return v === 'ON' || v === 'TRUE' || v === '1' || v === 'YES';
+    };
+
+    // Backwash is active when either of the two backwash bits is ON.
+    const backwashActive = isOn(bwTagRaw) || isOn(bwRunningRaw);
+
+    // Derive the current mode for logging / previous-mode tracking.
+    const currentMode = backwashActive
+      ? 'BACKWASH'
+      : isOn(feedPumpRaw) || isOn(hppPumpRaw)
+        ? 'FILTER'
+        : 'STANDBY';
 
     const enteredBackwash =
       currentMode === 'BACKWASH' && this._lastBackwashMode !== 'BACKWASH';
 
+    console.log(
+      `[MQTT-BACKWASH] bwTag=${bwTagRaw}, bwRunning=${bwRunningRaw}, ` +
+      `feedpump=${feedPumpRaw}, hpp=${hppPumpRaw}, ` +
+      `currentMode=${currentMode}, entered=${enteredBackwash}, ` +
+      `latched=${this._backwashLatched}`
+    );
+
     if (enteredBackwash && !this._backwashLatched) {
       this._backwashLatched = true;
 
-      // Grab the active high-pressure media reading for the message.
       const mediaPressureRaw =
         this.getValue('RO5-MediaFilterInPress') ??
         this.getValue('RO5-ROPressure');
-
       const mediaPressure = Number(mediaPressureRaw);
+
+      console.log(
+        `[MQTT-BACKWASH] 🔔 FIRING backwash notification (prev=${this._lastBackwashMode})`
+      );
 
       channels
         .sendBackwashNotification({
@@ -215,10 +235,9 @@ class AlertNotifier {
           mediaPressure: Number.isFinite(mediaPressure) ? mediaPressure : undefined,
           previousMode: this._lastBackwashMode || undefined,
         })
+        .then(() => console.log('[MQTT-BACKWASH] ✅ notification sent'))
         .catch((err) =>
-          this.log.error?.(
-            `[alert-notifier] backwash notification failed: ${err.message}`
-          )
+          this.log.error?.(`[MQTT-BACKWASH] ❌ failed: ${err.message}`)
         );
     }
 
@@ -237,15 +256,8 @@ class AlertNotifier {
     if (!stale) {
       try {
         const engine = this.rules.apply([
-          // Existing sensor/threshold alerts
           ...this.evaluateSensorAlerts(this.getValue, this.activeIds),
-
-          // Backwash filter DP alert
           evaluateBackwashFilterDpAlert(this.getValue),
-
-          // NOTE: `tankEmptyCandidate()` was REMOVED so the verbose
-          // sendEmail() does NOT fire for the tank-empty case.
-          // The simple `maybeNotifyTankEmpty()` below handles it instead.
         ]);
 
         this.activeIds = new Set(engine.filter((c) => c.active).map((c) => c.id));

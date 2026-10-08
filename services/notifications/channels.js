@@ -1,10 +1,9 @@
 // services/notifications/channels.js
 // One function per delivery channel. Each throws on failure.
-// `task` shape: { id, cycleId, title, severity, equipment, message, value, source, action, startedAt: Date }
 
 const crypto = require('crypto');
 const config = require('./config');
-const { rank, esc } = require('./util');
+const { rank, esc, withRetry } = require('./util');
 
 const fmtTime = (d) => d.toLocaleString('en-GB', { timeZone: config.calendar.timeZone });
 
@@ -19,34 +18,86 @@ function getMailer() {
   return mailer;
 }
 
-// One email per batch: a single alert gets its own subject, a burst gets a digest.
-// (This is the VERBOSE format used for threshold/engine alerts.)
-async function sendEmail(tasks) {
-  const { to, from } = config.email;
-  if (!to.length) throw new Error('ALERT_EMAIL_TO is empty');
+const EMAIL_BATCH_SIZE = Math.max(1, Number(process.env.EMAIL_BATCH_SIZE) || 50);
+
+// Resolves the recipient list.
+// Priority: explicit recipients argument → DB users (via recipients.js) →
+// ALERT_EMAIL_TO fallback.
+async function resolveRecipients(explicit) {
+  if (Array.isArray(explicit) && explicit.length) return explicit;
+
+  try {
+    const { getEmailRecipients } = require('./recipients');
+    const dbUsers = await getEmailRecipients(console);
+    if (dbUsers && dbUsers.length) return dbUsers;
+  } catch (err) {
+    console.error(`[channels] recipients lookup failed: ${err.message}`);
+  }
+
+  return config.email.to || [];
+}
+
+// One email per alert batch: single alert → own subject, burst → digest.
+// `recipients` overrides the DB lookup when provided.
+async function sendEmail(tasks, recipients = null) {
+  const { from } = config.email;
+
+  const list = await resolveRecipients(recipients);
+
+  if (!list.length) {
+    throw new Error(
+      'No email recipients: no DB users and ALERT_EMAIL_TO is empty.'
+    );
+  }
 
   const sorted = [...tasks].sort((a, b) => rank(b.severity) - rank(a.severity));
   const top = sorted[0];
-  const subject = sorted.length === 1
-    ? `[RO Plant][${top.severity}] ${top.title}`
-    : `[RO Plant] ${sorted.length} new alerts (highest: ${top.severity})`;
 
-  const text = sorted.map((t) =>
+  const subject =
+    sorted.length === 1
+      ? `[RO Plant Alert] ${top.title}`
+      : `[RO Plant Alert] ${sorted.length} new alerts`;
+
+  const text = sorted
+    .map(
+      (t) =>
 `• [${t.severity}] ${t.title}
-${t.message || t.equipment || ''}${t.value !== undefined ? ` (value: ${t.value})` : ''}
-Raised: ${fmtTime(t.startedAt)}
-Maintenance task: ${t.action}
-Ref: ${t.cycleId}`).join('\n\n');
+  ${t.message || t.equipment || ''}${t.value !== undefined ? ` (value: ${t.value})` : ''}
+  Raised: ${fmtTime(t.startedAt)}
+  Maintenance task: ${t.action}
+  Ref: ${t.cycleId}`
+    )
+    .join('\n\n');
 
-  const html = `<div style="font-family:sans-serif;font-size:14px">${sorted.map((t) =>
+  const html = `<div style="font-family:sans-serif;font-size:14px">${sorted
+    .map(
+      (t) =>
 `<div style="margin-bottom:14px">
   <b>[${esc(t.severity)}] ${esc(t.title)}</b><br>
   ${esc(t.message || t.equipment || '')}${t.value !== undefined ? ` <i>(value: ${esc(t.value)})</i>` : ''}<br>
   <small>Raised ${esc(fmtTime(t.startedAt))} · Ref ${esc(t.cycleId)}</small><br>
   <b>Maintenance task:</b> ${esc(t.action)}
-</div>`).join('')}</div>`;
+</div>`
+    )
+    .join('')}</div>`;
 
-  await getMailer().sendMail({ from, to, subject, text, html });
+  // Split into batches to respect SMTP provider limits.
+  const batches = [];
+  for (let i = 0; i < list.length; i += EMAIL_BATCH_SIZE) {
+    batches.push(list.slice(i, i + EMAIL_BATCH_SIZE));
+  }
+
+  let failed = 0;
+  for (const bcc of batches) {
+    try {
+      // "to" is the sender; the real recipients are all in BCC.
+      await withRetry(() => getMailer().sendMail({ from, to: from, bcc, subject, text, html }));
+    } catch (err) {
+      failed += 1;
+      console.error(`[channels] email batch of ${bcc.length} failed: ${err.message}`);
+    }
+  }
+  if (failed) throw new Error(`${failed} of ${batches.length} email batch(es) failed`);
 }
 
 // ───────────────────────── Slack (Web API) ─────────────────────────
@@ -157,41 +208,34 @@ Reference: ${t.cycleId}`,
 // ───────────────────────── Tank Empty Notification ─────────────────────────
 // Fired once when the feed tank reaches the empty threshold while
 // the RO plant is in standby mode.
-// Shape: { startedAt: Date, tankLevel: number, currentMode: string }
-
 async function sendTankEmptyNotification(info) {
   const { startedAt, tankLevel, currentMode } = info;
   const timeStr = fmtTime(startedAt);
 
   const title = 'Water Tank Empty — System on Standby';
   const message =
-    `The RO plant is currently in standby mode and the water tank is empty. ` +
+    `The RO plant is currently in standby mode and the water tank is Low. ` +
     `Please check the tank level and water supply.` +
     (tankLevel !== undefined ? ` Current tank level: ${Number(tankLevel).toFixed(1)}%.` : '') +
     (currentMode ? ` Current mode: ${currentMode}.` : '');
 
-  // --- Email ---
-  const { to, from } = config.email;
-  if (to.length && config.email.enabled !== false) {
+  const recipients = await resolveRecipients(null);
+  const { from } = config.email;
+
+  if (recipients.length && config.email.enabled !== false) {
     const subject = '[RO Plant][ALERT] Water Tank Empty';
-
-    const text =
-`${title}
-
-${message}
-
-${timeStr}`;
-
+    const text = `${title}\n\n${message}\n\n${timeStr}`;
     const html = `<div style="font-family:sans-serif;font-size:14px;line-height:1.5;color:#1f2937">
   <div style="font-weight:600;font-size:15px;color:#111827">${esc(title)}</div>
   <div style="color:#4b5563;margin-top:6px">${esc(message)}</div>
   <div style="font-size:12px;color:#6b7280;margin-top:8px">${esc(timeStr)}</div>
 </div>`;
-
-    await getMailer().sendMail({ from, to, subject, text, html });
+    await withRetry(() => getMailer().sendMail({ from, to: from, bcc: recipients, subject, text, html }));
+    console.log(`[channels] tank-empty email sent to ${recipients.length} recipient(s)`);
+  } else {
+    console.warn('[channels] tank-empty email skipped — no recipients');
   }
 
-  // --- Slack ---
   if (config.slack.botToken && config.slack.channel) {
     await slackCall('chat.postMessage', {
       channel: config.slack.channel,
@@ -201,9 +245,6 @@ ${timeStr}`;
 }
 
 // ───────────────────────── Backwash Notification ─────────────────────────
-// Fired once when the plant transitions INTO backwash mode.
-// Shape: { startedAt: Date, mediaPressure: number, previousMode: string }
-
 async function sendBackwashNotification(info) {
   const { startedAt, mediaPressure, previousMode } = info;
   const timeStr = fmtTime(startedAt);
@@ -215,26 +256,23 @@ async function sendBackwashNotification(info) {
     (mediaPressure !== undefined ? ` (${Number(mediaPressure).toFixed(2)} bar)` : '') +
     (previousMode ? `. Previous mode: ${previousMode}.` : '.');
 
-  // --- Email ---
-  const { to, from } = config.email;
-  if (to.length && config.email.enabled !== false) {
+  const recipients = await resolveRecipients(null);
+  const { from } = config.email;
+
+  if (recipients.length && config.email.enabled !== false) {
     const subject = `RO Plant: ${title}`;
-
-    const text =
-`${title}
-${message}
-${timeStr}`;
-
+    const text = `${title}\n\n${message}\n\n${timeStr}`;
     const html = `<div style="font-family:sans-serif;font-size:14px;line-height:1.5;color:#1f2937">
   <div style="font-weight:600;font-size:15px;color:#111827">${esc(title)}</div>
   <div style="color:#4b5563">${esc(message)}</div>
   <div style="font-size:12px;color:#6b7280;margin-top:2px">${esc(timeStr)}</div>
 </div>`;
-
-    await getMailer().sendMail({ from, to, subject, text, html });
+    await withRetry(() => getMailer().sendMail({ from, to: from, bcc: recipients, subject, text, html }));
+    console.log(`[channels] backwash email sent to ${recipients.length} recipient(s)`);
+  } else {
+    console.warn('[channels] backwash email skipped — no recipients');
   }
 
-  // --- Slack ---
   if (config.slack.botToken && config.slack.channel) {
     await slackCall('chat.postMessage', {
       channel: config.slack.channel,
