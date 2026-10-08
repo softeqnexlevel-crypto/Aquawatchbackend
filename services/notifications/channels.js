@@ -212,7 +212,7 @@ async function sendTankEmptyNotification(info) {
   const { startedAt, tankLevel, currentMode } = info;
   const timeStr = fmtTime(startedAt);
 
-  const title = 'Water Tank Empty — System on Standby';
+  const title = 'Water Tank Low — System on Standby';
   const message =
     `The RO plant is currently in standby mode and the water tank is Low. ` +
     `Please check the tank level and water supply.` +
