@@ -252,7 +252,7 @@ async function sendBackwashNotification(info) {
   const title = 'System in Backwash Mode';
   const message =
     `The RO plant has switched to backwash Mode. ` +
-    `Media filter Differential pressure is high, system is backwasing` +
+    `Media filter Differential pressure is high, system is backwashing` +
     (mediaPressure !== undefined ? ` (${Number(mediaPressure).toFixed(2)} bar)` : '') +
     (previousMode ? `. Previous mode: ${previousMode}.` : '.');
 
