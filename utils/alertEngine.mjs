@@ -160,7 +160,7 @@
     { key: 'RO5-S2DeltaHigh', message: 'High Differential Pressure - Stage 2', equipment: 'RO5 - Stage 2', severity: 'High', description: 'Stage 2 membrane differential pressure has exceeded the PLC-set limit.' },
     { key: 'RO5-S1DeltaHigh', message: 'High Differential Pressure - Stage 1', equipment: 'RO5 - Stage 1', severity: 'Critical', description: 'Stage 1 membrane differential pressure has exceeded the PLC-set limit.' },
     { key: 'RO5-HighROPressure', message: 'High RO Pressure', equipment: 'RO5 - RO Pressure', severity: 'Critical', description: 'RO system pressure has exceeded the PLC-set limit.' },
-    { key: 'RO5-FeedTankLow', message: 'Feed Tank Low Signal', equipment: 'RO5 - Feed Tank', severity: 'Critical', description: 'PLC reports the feed tank low bit is ON. Feed pump may stop soon to prevent dry-run.' },
+      { key: 'RO5-FeedTankLow', message: 'Feed Tank Low Signal', equipment: 'RO5 - Feed Tank', severity: 'Critical', description: 'PLC reports the feed tank low bit is ON.', levelKey: 'RO5-FeedTankLevel' },
     // { key: 'RO5-FeedTankLow', message: 'Low Feed Tank Level', equipment: 'RO5 - Feed Tank', severity: 'Critical', description: 'Feed tank level is low — feed pump may stop soon to prevent dry-run.' },
   ];
 
@@ -270,18 +270,33 @@
     }
 
     // -------------------- PLC bit alarms --------------------
-    BIT_ALARMS.forEach(({ key, message, equipment, severity, description }) => {
+        BIT_ALARMS.forEach(({ key, message, equipment, severity, description, levelKey }) => {
       const raw = getValue(key);
-      if (raw === undefined || raw === null) return; // no reading yet — skip, don't false-alarm
+      if (raw === undefined || raw === null) return; // no reading yet, skip
+
+      let value = toDisplayString(raw);
+      let threshold = 'OFF required';
+      let desc = description;
+
+      // Bit alarms that also report a level (e.g. feed tank low bit + tank %)
+      if (levelKey) {
+        const lvl = toNumber(getValue(levelKey), NaN);
+        if (Number.isFinite(lvl)) {
+          value = `${lvl.toFixed(1)}%`;
+          threshold = '';
+          desc = `${description} Current tank level: ${lvl.toFixed(1)}%.`;
+        }
+      }
+
       push(`${key}:bit`, isActive(raw), {
         sensorKey: key,
         severity,
         message,
         equipment,
-        value: toDisplayString(raw),
-        threshold: 'OFF required',
+        value,
+        threshold,
         source: 'PLC',
-        description,
+        description: desc,
       });
     });
 
