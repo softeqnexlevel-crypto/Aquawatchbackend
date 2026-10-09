@@ -270,32 +270,35 @@ startAlertNotifier({
 
   });
 
+
 function notifyTag(record) {
-
-  if (!alertNotifier || !record || record.simulated) {
-
+  if (!record || record.simulated) {
     return;
+  }
 
+  if (!alertNotifier) {
+    console.warn(
+      '[plc] ALERT NOTIFIER IS NULL — cannot evaluate:',
+      record.parameter
+    );
+    return;
   }
 
   try {
-
-    alertNotifier.onTag();
-
-  } catch (err) {
-
-    console.error(
-
-      '[plc] alert notifier onTag error:',
-
-      err && err.message ? err.message : err
-
+    console.log(
+      '[plc] Sending sensor value to notifier:',
+      record.parameter,
+      record.value
     );
 
+    alertNotifier.onTag();
+  } catch (err) {
+    console.error(
+      '[plc] alert notifier onTag error:',
+      err && err.stack ? err.stack : err
+    );
   }
-
 }
-
 /* ============================================================
 
    DATABASE SAMPLING
@@ -1264,7 +1267,36 @@ function recordToDB(record) {
 
    ============================================================ */
 
-function processMeasurement(topic, measurement, idx, rawBuf) {
+
+function notifyTag(record) {
+  if (!record || record.simulated) {
+    return;
+  }
+
+  if (!alertNotifier) {
+    console.warn(
+      '[plc] ALERT NOTIFIER IS NULL — cannot evaluate:',
+      record.parameter
+    );
+    return;
+  }
+
+  try {
+    console.log(
+      '[plc] Sending sensor value to notifier:',
+      record.parameter,
+      record.value
+    );
+
+    alertNotifier.onTag();
+  } catch (err) {
+    console.error(
+      '[plc] alert notifier onTag error:',
+      err && err.stack ? err.stack : err
+    );
+  }
+}
+   function processMeasurement(topic, measurement, idx, rawBuf) {
 
   let parameter =
 

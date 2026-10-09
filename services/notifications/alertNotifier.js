@@ -424,7 +424,6 @@ class AlertNotifier {
       if (forSlack.length) this.log.info?.(`[alert-notifier][DRY RUN] SLACK:\n${lines(forSlack)}`);
       if (forCal.length) this.log.info?.(`[alert-notifier][DRY RUN] CALENDAR:\n${lines(forCal)}`);
 
-      CHANNELS.forEach((ch) => this.markSent(ch, forChannel(ch).map((t) => t.id)));
       return;
     }
 
@@ -435,18 +434,34 @@ class AlertNotifier {
     ].filter(Boolean));
   }
 
-  async runEmail(tasks) {
-    try {
-      const recipients = await getEmailRecipients(this.log);
-      await withRetry(() => channels.sendEmail(tasks, recipients));
-      this.log.info?.(`[alert-notifier] email sent to ${recipients.length} user(s) (${tasks.length} alert(s))`);
-      return tasks.map((t) => t.id);
-    } catch (err) {
-      this.log.error?.(`[alert-notifier] email failed: ${err.message}`);
-      return [];
-    }
-  }
+async runEmail(tasks) {
+  try {
+    this.log.info?.(
+      `[alert-notifier] Email dispatch started: ${tasks.length} alert(s)`
+    );
 
+    const recipients = await getEmailRecipients(this.log);
+
+    this.log.info?.(
+      `[alert-notifier] Recipient lookup returned ${recipients.length} recipient(s)`
+    );
+
+    await withRetry(() => channels.sendEmail(tasks, recipients));
+
+    this.log.info?.(
+      `[alert-notifier] Email dispatch completed for ${tasks.length} alert(s)`
+    );
+
+    return tasks.map((t) => t.id);
+  } catch (err) {
+    this.log.error?.(
+      `[alert-notifier] email failed: ${err?.stack || err?.message || err}`
+    );
+
+    return [];
+
+  }
+}
   async runSlack(tasks) {
     const delivered = [];
     const shown = tasks.slice(0, config.maxSlackPerBatch);
