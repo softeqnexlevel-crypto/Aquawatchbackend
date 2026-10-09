@@ -223,7 +223,7 @@ async function sendTankEmptyNotification(info) {
   const { from } = config.email;
 
   if (recipients.length && config.email.enabled !== false) {
-    const subject = 'RO Plant ALERT - Water Tank Empty';
+    const subject = 'RO Plant ALERT, Water Tank Empty';
     const text = `${title}\n\n${message}\n\n${timeStr}`;
     const html = `<div style="font-family:sans-serif;font-size:14px;line-height:1.5;color:#1f2937">
   <div style="font-weight:600;font-size:15px;color:#111827">${esc(title)}</div>
