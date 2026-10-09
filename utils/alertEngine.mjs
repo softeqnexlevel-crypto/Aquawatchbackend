@@ -160,6 +160,7 @@
     { key: 'RO5-S2DeltaHigh', message: 'High Differential Pressure - Stage 2', equipment: 'RO5 - Stage 2', severity: 'High', description: 'Stage 2 membrane differential pressure has exceeded the PLC-set limit.' },
     { key: 'RO5-S1DeltaHigh', message: 'High Differential Pressure - Stage 1', equipment: 'RO5 - Stage 1', severity: 'Critical', description: 'Stage 1 membrane differential pressure has exceeded the PLC-set limit.' },
     { key: 'RO5-HighROPressure', message: 'High RO Pressure', equipment: 'RO5 - RO Pressure', severity: 'Critical', description: 'RO system pressure has exceeded the PLC-set limit.' },
+    { key: 'RO5-FeedTankLow', message: 'Feed Tank Low Signal', equipment: 'RO5 - Feed Tank', severity: 'Critical', description: 'PLC reports the feed tank low bit is ON. Feed pump may stop soon to prevent dry-run.' },
     // { key: 'RO5-FeedTankLow', message: 'Low Feed Tank Level', equipment: 'RO5 - Feed Tank', severity: 'Critical', description: 'Feed tank level is low — feed pump may stop soon to prevent dry-run.' },
   ];
 

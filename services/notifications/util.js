@@ -58,6 +58,7 @@ const ACTIONS = {
   'plc data lost': 'Check ABox/PLC power and network, the MQTT broker and the backend connection',
   'antiscalant dosing stopped': 'Check dosing pump, antiscalant tank level and dosing line',
   'system in backwash mode': 'No action needed — automatic backwash cycle in progress; filtering resumes when it completes',
+  'feed tank low signal': 'Check raw-water supply and feed tank inlet valve; refill before pumps trip on dry-run',
 };
 
 const actionFor = (title) => ACTIONS[String(title || '').trim().toLowerCase()] || `Investigate and resolve: ${title}`;
