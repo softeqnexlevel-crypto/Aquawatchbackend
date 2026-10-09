@@ -5,6 +5,7 @@ const productionRoutes = require("./production.routes"); // ✅ ADDED
 const settingsRoutes = require("./settings.routes"); // ✅ ADDED
 const billingRoutes = require("./Billing.routes"); // ✅ ADDED — exposes /api/billing/*
 const aiRoutes = require("./ai"); // ✅ ADDED — exposes POST /api/ai/chat
+const { getAlertEvents } = require("../database/postgres");
 
 const router = express.Router();
 
@@ -24,7 +25,13 @@ router.get("/health", (req, res) => {
   });
 });
 
-router.get("/current", ctrl.current);
+router.get("/current", ctrl.current); router.get("/alert-events", async (req, res) => {
+  try {
+    res.json(await getAlertEvents(Number(req.query.limit) || 500));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 router.get("/status", ctrl.status);
 router.get("/alarms", ctrl.alarms);
 router.get("/mqtt-status", ctrl.mqttStatus);

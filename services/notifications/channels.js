@@ -228,7 +228,7 @@ async function sendTankEmptyNotification(info) {
     startedAt.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
 
   if (recipients.length && config.email.enabled !== false) {
-    const subject = 'RO Plant Alert- Water Tank Low';
+    const subject = 'RO Plant Alert- Feed Tank Low';
 
     const text =
 `${title}

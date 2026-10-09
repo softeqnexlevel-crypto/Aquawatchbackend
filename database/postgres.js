@@ -37,7 +37,7 @@ async function initDb() {
 
         await pool.query('SELECT 1');
         console.log('[DB] Connected to PostgreSQL');
-
+        await ensureAlertEventsTable();
         pool.on('error', (err) => {
             console.error('[DB] Pool error:', err.message);
         });
@@ -812,11 +812,51 @@ async function getActiveSubscription(userId) {
 }
 
 // ============================================================
+// REPOSITORY: ALERT EVENTS (server-side alert history)
+// ============================================================
+
+async function ensureAlertEventsTable() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS alert_events (
+            id UUID PRIMARY KEY,
+            alert_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            type TEXT,
+            severity TEXT,
+            equipment TEXT,
+            value TEXT,
+            time TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS alert_events_time_idx ON alert_events (time DESC)');
+}
+
+async function saveAlertEvent(e) {
+    await getPool().query(
+        `INSERT INTO alert_events (id, alert_id, kind, type, severity, equipment, value, time)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+        [generateUUID(), e.alertId, e.kind, e.type || null, e.severity || null,
+         e.equipment || null, e.value != null ? String(e.value) : null]
+    );
+}
+
+async function getAlertEvents(limit = 500) {
+    const r = await getPool().query(
+        `SELECT id, alert_id AS "alertId", kind, type, severity, equipment, value, time
+         FROM alert_events ORDER BY time DESC LIMIT $1`,
+        [limit]
+    );
+    return r.rows;
+}
+
+// ============================================================
 // EXPORTS
 // ============================================================
 
 module.exports = {
     // Init
+    saveAlertEvent,
+    getAlertEvents,
     initDb,
     getDb,
     getPool,

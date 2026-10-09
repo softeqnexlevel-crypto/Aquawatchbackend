@@ -10,6 +10,11 @@ const { getEmailRecipients } = require('./recipients');
 const { evaluateBackwashFilterDpAlert, AlertRules } = require('./rules');
 const { slug, withRetry, actionFor, channelAllows } = require('./util');
 const { rawKeysFor } = require('./keyMap');
+const { saveAlertEvent } = require('../../database/postgres');
+
+// Alert types stored in the website history (separate from the email filter).
+const WEB_TYPES = (process.env.WEB_ALERT_TYPES || 'Power Problem')
+  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
 const CHANNELS = ['email', 'slack', 'calendar'];
 
@@ -337,7 +342,13 @@ class AlertNotifier {
     const last = this.lastSent(prev, channel);
     return Boolean(last) && now - new Date(last) < config.cooldownMs;
   }
-
+  recordWebEvent(kind, a) {
+    if (!WEB_TYPES.includes(String(a.title || '').trim().toLowerCase())) return;
+    saveAlertEvent({
+      alertId: a.id, kind, type: a.title, severity: a.severity,
+      equipment: a.equipment, value: a.value,
+    }).catch((err) => this.log.error?.(`[alert-notifier] web history save failed: ${err.message}`));
+  }
   onRaised(c) {
     const now = new Date();
     const prev = this.state[c.id];
@@ -369,13 +380,20 @@ class AlertNotifier {
       CHANNELS.forEach((ch) => { sent[ch] = prev.lastNotifiedAt; });
     }
 
-    this.state[c.id] = {
+        this.state[c.id] = {
       active: true,
       startedAt: now.toISOString(),
       cycleId: task.cycleId,
       slackTs: null,
       sent,
+      title: c.message,
+      severity: c.severity,
+      equipment: c.equipment,
     };
+
+    this.recordWebEvent('triggered', {
+      id: c.id, title: c.message, severity: c.severity, equipment: c.equipment, value: c.value,
+    });
 
     this.saveState();
 
@@ -513,6 +531,9 @@ async runEmail(tasks) {
   async onCleared(id) {
     const st = this.state[id];
     this.state[id] = { ...st, active: false, slackTs: null };
+        this.recordWebEvent('cleared', {
+      id, title: st.title, severity: st.severity, equipment: st.equipment,
+    });
     this.saveState();
 
     if (st.slackTs && config.slack.enabled && !config.dryRun) {
