@@ -3,7 +3,7 @@
 
 const crypto = require('crypto');
 const config = require('./config');
-const { rank, esc, withRetry } = require('./util');
+const { rank, esc, withRetry, actionFor, slug } = require('./util');
 
 const fmtTime = (d) => d.toLocaleString('en-GB', { timeZone: config.calendar.timeZone });
 
@@ -212,24 +212,40 @@ async function sendTankEmptyNotification(info) {
   const { startedAt, tankLevel, currentMode } = info;
   const timeStr = fmtTime(startedAt);
 
-  const title = 'Water Tank Low — System on Standby';
+  const title = 'Water Tank Low — System on Standby mode';
   const message =
     `The RO plant is currently in standby mode and the water tank is Low. ` +
     `Please check the tank level and water supply.` +
     (tankLevel !== undefined ? ` Current tank level: ${Number(tankLevel).toFixed(1)}%.` : '') +
     (currentMode ? ` Current mode: ${currentMode}.` : '');
 
-  const recipients = await resolveRecipients(null);
+   const recipients = await resolveRecipients(null);
   const { from } = config.email;
+
+  const action = actionFor('Low Feed Tank Level');
+  const ref =
+    `${slug('RO5-FeedTankLevel')}-standby-` +
+    startedAt.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
 
   if (recipients.length && config.email.enabled !== false) {
     const subject = 'RO Plant ALERT, Water Tank Empty';
-    const text = `${title}\n\n${message}\n\n${timeStr}`;
+
+    const text =
+`${title}
+
+${message}
+
+Raised: ${timeStr}
+Ref: ${ref}
+Maintenance task: ${action}`;
+
     const html = `<div style="font-family:sans-serif;font-size:14px;line-height:1.5;color:#1f2937">
   <div style="font-weight:600;font-size:15px;color:#111827">${esc(title)}</div>
   <div style="color:#4b5563;margin-top:6px">${esc(message)}</div>
-  <div style="font-size:12px;color:#6b7280;margin-top:8px">${esc(timeStr)}</div>
+  <div style="font-size:12px;color:#6b7280;margin-top:8px">Raised ${esc(timeStr)} · Ref ${esc(ref)}</div>
+  <div style="margin-top:8px"><b>Maintenance task:</b> ${esc(action)}</div>
 </div>`;
+
     await withRetry(() => getMailer().sendMail({ from, to: from, bcc: recipients, subject, text, html }));
     console.log(`[channels] tank-empty email sent to ${recipients.length} recipient(s)`);
   } else {
@@ -256,17 +272,33 @@ async function sendBackwashNotification(info) {
     (mediaPressure !== undefined ? ` (${Number(mediaPressure).toFixed(2)} bar)` : '') +
     (previousMode ? `. Previous mode: ${previousMode}.` : '.');
 
-  const recipients = await resolveRecipients(null);
+   const recipients = await resolveRecipients(null);
   const { from } = config.email;
+
+  const action = actionFor('High Media Filter Differential Pressure');
+  const ref =
+    `${slug('RO5-Backwash')}-` +
+    startedAt.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
 
   if (recipients.length && config.email.enabled !== false) {
     const subject = `RO Plant: ${title}`;
-    const text = `${title}\n\n${message}\n\n${timeStr}`;
+
+    const text =
+`${title}
+
+${message}
+
+Raised: ${timeStr}
+Ref: ${ref}
+Maintenance task: ${action}`;
+
     const html = `<div style="font-family:sans-serif;font-size:14px;line-height:1.5;color:#1f2937">
   <div style="font-weight:600;font-size:15px;color:#111827">${esc(title)}</div>
-  <div style="color:#4b5563">${esc(message)}</div>
-  <div style="font-size:12px;color:#6b7280;margin-top:2px">${esc(timeStr)}</div>
+  <div style="color:#4b5563;margin-top:6px">${esc(message)}</div>
+  <div style="font-size:12px;color:#6b7280;margin-top:8px">Raised ${esc(timeStr)} · Ref ${esc(ref)}</div>
+  <div style="margin-top:8px"><b>Maintenance task:</b> ${esc(action)}</div>
 </div>`;
+
     await withRetry(() => getMailer().sendMail({ from, to: from, bcc: recipients, subject, text, html }));
     console.log(`[channels] backwash email sent to ${recipients.length} recipient(s)`);
   } else {
