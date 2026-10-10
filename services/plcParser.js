@@ -1900,6 +1900,9 @@ function handleIncoming(topic, raw) {
 
   }
 
+    // Any packet from the ABox proves the link is alive.
+  if (alertNotifier) alertNotifier.onTag();
+
   /* RAW DEBUG LOG */
 
   dlog('INCOMING', {

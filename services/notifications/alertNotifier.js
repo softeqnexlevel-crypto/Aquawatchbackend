@@ -342,12 +342,24 @@ class AlertNotifier {
     const last = this.lastSent(prev, channel);
     return Boolean(last) && now - new Date(last) < config.cooldownMs;
   }
-  recordWebEvent(kind, a) {
+  
+   recordWebEvent(kind, a) {
     if (!WEB_TYPES.includes(String(a.title || '').trim().toLowerCase())) return;
+
+    this._webOpen = this._webOpen || new Set();
+    if (kind === 'triggered') {
+      if (this._webOpen.has(a.id)) return;
+      this._webOpen.add(a.id);
+    } else {
+      if (!this._webOpen.has(a.id)) return; // stale state from before restart
+      this._webOpen.delete(a.id);
+    }
+
     saveAlertEvent({
       alertId: a.id, kind, type: a.title, severity: a.severity,
       equipment: a.equipment, value: a.value,
     }).catch((err) => this.log.error?.(`[alert-notifier] web history save failed: ${err.message}`));
+  
   }
   onRaised(c) {
     const now = new Date();
