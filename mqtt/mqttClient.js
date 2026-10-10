@@ -60,6 +60,8 @@ function initMqtt() {
 
     client.on("message", (topic, payload) => {
 
+      console.log(`[mqtt] message on ${topic} (${payload.length} bytes)`);
+
       try {
 
         handleIncoming(topic, payload.toString());
