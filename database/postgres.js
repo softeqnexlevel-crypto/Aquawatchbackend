@@ -37,6 +37,7 @@ async function initDb() {
 
         await pool.query('SELECT 1');
         console.log('[DB] Connected to PostgreSQL');
+        
         await ensureAlertEventsTable();
         pool.on('error', (err) => {
             console.error('[DB] Pool error:', err.message);
