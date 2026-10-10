@@ -126,7 +126,7 @@
     'RO5-FeedTankLevel': {
       equipment: 'RO5 - FeedTankLevel',
       rules: [
-        { type: 'critical', direction: 'low', value: 20, clear: 23, severity: 'Critical', message: 'Low Feed Tank Level' },
+        {  direction: 'low', value: 20, clear: 23, severity: 'Critical', message: 'Low Feed Tank Level' },
         { type: 'warning', direction: 'low', value: 30, clear: 33, severity: 'Medium', message: 'Low Feed Tank Level' },
       ],
     },
