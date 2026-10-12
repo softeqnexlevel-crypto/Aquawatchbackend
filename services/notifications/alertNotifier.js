@@ -18,6 +18,9 @@ const WEB_TYPES = (process.env.WEB_ALERT_TYPES || 'Power Problem')
 
 const CHANNELS = ['email', 'slack', 'calendar'];
 
+// Staff reminder interval while an alarm stays active (0 = no reminders).
+const REMINDER_MS = Number(process.env.OPERATOR_REMINDER_MS ?? 15 * 60 * 1000);
+
 const AUDIT_KEYS = [
   'RO5-Feedpump',
   'RO5-HPPpump',
@@ -301,6 +304,56 @@ class AlertNotifier {
         }
       }
     }
+
+    this.maybeRemind(candidates);
+  }
+
+  // Re-emails staff (operators/admins) every REMINDER_MS while an alarm that
+  // was already emailed stays active. Clients never receive reminders.
+  maybeRemind(candidates) {
+    if (!REMINDER_MS || config.dryRun) return;
+    const now = Date.now();
+
+    for (const c of candidates) {
+      const st = this.state[c.id];
+      if (!c.active || !st?.active || !st.emailedThisCycle) continue;
+
+      const last = Math.max(
+        st.lastReminderAt ? new Date(st.lastReminderAt).getTime() : 0,
+        st.sent?.email ? new Date(st.sent.email).getTime() : 0,
+        st.startedAt ? new Date(st.startedAt).getTime() : 0
+      );
+      if (now - last < REMINDER_MS) continue;
+
+      const task = {
+        id: c.id,
+        cycleId: st.cycleId,
+        title: c.message,
+        severity: c.severity,
+        equipment: c.equipment,
+        message: c.description || '',
+        value:
+          c.value !== undefined
+            ? c.threshold ? `${c.value} (limit ${c.threshold})` : String(c.value)
+            : undefined,
+        source: c.source,
+        action: actionFor(c.message),
+        startedAt: new Date(st.startedAt),
+        reminder: true,
+      };
+
+      if (!channelAllows('email', task)) continue;
+
+      st.lastReminderAt = new Date().toISOString();
+      this.saveState();
+
+      channels
+        .sendEmail([task])
+        .then(() => this.log.info?.(`[alert-notifier] reminder sent for "${c.message}"`))
+        .catch((err) =>
+          this.log.error?.(`[alert-notifier] reminder failed for "${c.message}": ${err.message}`)
+        );
+    }
   }
 
   auditOnce() {
@@ -428,6 +481,7 @@ class AlertNotifier {
     ids.forEach((id) => {
       if (this.state[id]) {
         this.state[id].sent = { ...(this.state[id].sent || {}), [channel]: stamp };
+        if (channel === 'email') this.state[id].emailedThisCycle = true;
       }
     });
     this.saveState();
@@ -470,13 +524,9 @@ async runEmail(tasks) {
       `[alert-notifier] Email dispatch started: ${tasks.length} alert(s)`
     );
 
-    const recipients = await getEmailRecipients(this.log);
-
-    this.log.info?.(
-      `[alert-notifier] Recipient lookup returned ${recipients.length} recipient(s)`
-    );
-
-    await withRetry(() => channels.sendEmail(tasks, recipients));
+    // channels.sendEmail splits staff (everything) from clients (limited,
+    // capped per day), so no recipient list is passed in here.
+    await withRetry(() => channels.sendEmail(tasks));
 
     this.log.info?.(
       `[alert-notifier] Email dispatch completed for ${tasks.length} alert(s)`
@@ -547,6 +597,27 @@ async runEmail(tasks) {
       id, title: st.title, severity: st.severity, equipment: st.equipment,
     });
     this.saveState();
+
+    // Tell staff when an alarm they were emailed about has cleared.
+    if (st.emailedThisCycle && !config.dryRun) {
+      const clearedAt = new Date();
+      const minutes = Math.max(
+        1,
+        Math.round((clearedAt.getTime() - new Date(st.startedAt).getTime()) / 60000)
+      );
+      channels
+        .sendClearedEmail({
+          title: st.title,
+          severity: st.severity,
+          equipment: st.equipment,
+          startedAt: st.startedAt,
+          clearedAt,
+          minutes,
+        })
+        .catch((err) =>
+          this.log.error?.(`[alert-notifier] cleared email failed for "${st.title}": ${err.message}`)
+        );
+    }
 
     if (st.slackTs && config.slack.enabled && !config.dryRun) {
       const minutes = Math.max(1, Math.round((Date.now() - new Date(st.startedAt).getTime()) / 60000));

@@ -9,7 +9,7 @@
 //   - DataContext.jsx KEY_MAPPING   -> normalizeSnapshot() below
 //   - Dashboard.jsx mode resolution -> operationMode below
 //   - feedTankCalibration.js        -> rawToPercent() below (4.9 = 0%)
-//   - alertEngine / AlertsContext   -> single "Low Feed Tank Level" alert
+//   - alertEngine / AlertsContext   -> Power Problem, Feed Tank Low Signal, PLC Data Lost
 //   - /api/production-summary       -> db.getProductionSummary()
 //
 // buildSystemContext() is ASYNC (production totals, trends and targets come
@@ -71,6 +71,7 @@ const KEY_ALIASES = {
   'Antiscalant': 'RO5-AntiscalantDosingActive',
   'AntiscalantDaily': 'RO5-AntiscalantDaily',
   'SystemRunhrs': 'RO5-SystemRunhrs',
+  'SystemDailyRunHrs': 'RO5-SystemDailyRunHrs',
   'FeedTankLevel': 'RO5-FeedTankLevel',
   'FT-A': 'RO5-FeedTankLevel',
   'FeedTank': 'RO5-FeedTankLevel',
@@ -111,25 +112,14 @@ const FILTER_DELTA_P_CRITICAL_BAR = 0.40;
 const MASS_BALANCE_LIMIT_M3H = 5;
 
 // ==================== ALERTS ====================
-// The web app only raises ONE alert type: "Low Feed Tank Level"
-//   Critical: below 20% (clears at 23%), Medium: below 30% (clears at 33%)
-let tankCriticalActive = false;
-let tankWarningActive = false;
-
-function evaluateLowFeedTankAlert(levelPct) {
-  if (levelPct === null) {
-    tankCriticalActive = false;
-    tankWarningActive = false;
-    return null;
-  }
-  tankCriticalActive = tankCriticalActive ? levelPct < 23 : levelPct < 20;
-  tankWarningActive = tankWarningActive ? levelPct < 33 : levelPct < 30;
-
-  const value = `${levelPct.toFixed(1)} %`;
-  if (tankCriticalActive) return { type: 'Low Feed Tank Level', severity: 'Critical', value, threshold: '< 20 %' };
-  if (tankWarningActive) return { type: 'Low Feed Tank Level', severity: 'Medium', value, threshold: '< 30 %' };
-  return null;
-}
+// The web Alerts Center shows exactly these types, all driven by PLC bits or
+// data freshness (see AlertsContext.jsx ALLOWED_ALERT_TYPES):
+//   - Power Problem          (RO5-PowerProblem bit ON)
+//   - Feed Tank Low Signal   (RO5-FeedTankLow bit ON, shown with the tank %)
+//   - PLC Data Lost          (no live data from the PLC)
+// "Low Feed Tank Level" (percentage based) is only an email alert, not shown
+// on the website.
+const MONITORED_ALERT_TYPES = ['Power Problem', 'Feed Tank Low Signal', 'PLC Data Lost'];
 
 function computeHealthScore(alarms) {
   let score = 100;
@@ -266,7 +256,7 @@ async function loadTrends() {
     return {
       available: true,
       windows,
-      note: 'Summaries of stored measurements (about one sample per 30 seconds per tag). A small samples count means limited data for that window.',
+      note: 'Summaries of stored measurements (about one sample per minute per tag). A small samples count means limited data for that window.',
     };
   } catch (err) {
     console.error('[ai/context] trends failed:', err && err.message ? err.message : err);
@@ -319,7 +309,11 @@ async function buildSystemContext(options = {}) {
   const systemActive = isActive(systemActiveRaw);
 
   const feedPumpOn = isActive(snapshot['RO5-Feedpump']);
-  const backwashOn = isActive(snapshot['RO5-PrefilterBackwash']);
+  const hppOn = isActive(snapshot['RO5-HPPpump']);
+  const backwashOn =
+    isActive(snapshot['RO5-PrefilterBackwash']) || isActive(snapshot['RO5-PrefilterBackwashing']);
+  const feedTankLowBit = isActive(snapshot['RO5-FeedTankLow']);
+  const powerProblemBit = isActive(snapshot['RO5-PowerProblem']);
   const dosingOn = isActive(snapshot['RO5-AntiscalantDosingActive']);
   const plcModeRaw = snapshot['RO5-SystemMode'];
 
@@ -331,8 +325,20 @@ async function buildSystemContext(options = {}) {
 
   // ---- Alerts ----
   const activeAlarms = [];
-  const tankAlert = evaluateLowFeedTankAlert(tankPct);
-  if (tankAlert) activeAlarms.push(tankAlert);
+  if (!dataAvailable) {
+    activeAlarms.push({ type: 'PLC Data Lost', severity: 'Critical', value: 'No data from PLC' });
+  } else {
+    if (powerProblemBit) {
+      activeAlarms.push({ type: 'Power Problem', severity: 'Critical', value: 'PLC power problem bit is ON' });
+    }
+    if (feedTankLowBit) {
+      activeAlarms.push({
+        type: 'Feed Tank Low Signal',
+        severity: 'Critical',
+        value: tankPct !== null ? `PLC low bit ON, tank ${tankPct.toFixed(1)} %` : 'PLC low bit ON',
+      });
+    }
+  }
   const criticalAlarmsPresent = activeAlarms.some((a) => a.severity === 'Critical');
 
   // ---- Mode resolution (same priority as Dashboard.jsx) ----
@@ -356,9 +362,10 @@ async function buildSystemContext(options = {}) {
   const controlMode =
     typeof plcModeRaw === 'string' && plcModeRaw.toLowerCase().trim() === 'auto' ? 'AUTO' : 'MANUAL';
 
-  const highPressurePumpOn = operationMode === 'FILTER' && systemActive;
-  const dosingPumpOn = highPressurePumpOn && dosingOn;
-  const feedPumpRunning = feedPumpOn && !tankEmpty;
+  // Equipment states follow the PLC bits directly, as on the dashboard.
+  const highPressurePumpOn = systemActive && hppOn;
+  const dosingPumpOn = systemActive && dosingOn;
+  const feedPumpRunning = systemActive && feedPumpOn;
 
   // ---- Shared numbers ----
   const feedFlow = num('RO5-FEEDFlow');
@@ -400,6 +407,7 @@ async function buildSystemContext(options = {}) {
       dosingPumpOn,
       backwashActive: backwashOn,
       runHours_hrs: num('RO5-SystemRunhrs'),
+      dailyRunHours_hrs: num('RO5-SystemDailyRunHrs'),
     },
 
     // ---------- Tank level page ----------
@@ -409,6 +417,7 @@ async function buildSystemContext(options = {}) {
       status: tankStatus,        // Critical < 20, Low < 30, Normal
       gaugeBand: tankGaugeBand,  // Bottom < 25, Middle < 50, Top
       empty: tankEmpty,
+      lowSignalBitOn: feedTankLowBit,
       note: 'Level is calibrated from the raw transmitter signal (4.9 = 0%, 10.0 = 100%).',
     },
 
@@ -435,15 +444,15 @@ async function buildSystemContext(options = {}) {
       stage2DeltaP_bar: stage2,
       membraneDeltaPCriticalAtOrAbove_bar: MEMBRANE_DELTA_P_CRITICAL_BAR,
       roPressure_bar: roPressure,
-      // PLC status bits. Informational only: the web Alerts Center does not
-      // raise alarms from these.
+      // PLC status bits. Only powerProblem raises a web alarm; the rest are
+      // informational flags.
       plcBits: {
         highPrefilterDeltaP: isActive(snapshot['RO5-HighPrefilterDeltaP']),
         highMediaDeltaP: isActive(snapshot['RO5-HighMediaDeltaP']),
         stage1DeltaHigh: isActive(snapshot['RO5-S1DeltaHigh']),
         stage2DeltaHigh: isActive(snapshot['RO5-S2DeltaHigh']),
         highROPressure: isActive(snapshot['RO5-HighROPressure']),
-        powerProblem: isActive(snapshot['RO5-PowerProblem']),
+        powerProblem: powerProblemBit,
       },
     },
 
@@ -472,7 +481,7 @@ async function buildSystemContext(options = {}) {
     alerts: {
       activeAlarms,
       healthScore: computeHealthScore(activeAlarms),
-      monitoredAlertTypes: ['Low Feed Tank Level'],
+      monitoredAlertTypes: MONITORED_ALERT_TYPES,
     },
 
     // Things Aqua AI has no data for yet. If asked, say so plainly.
@@ -501,13 +510,14 @@ Rules you must always follow:
 How to read the context (it matches what the operator sees on the web app):
 - The context has one section per page: system, tank, production, filtration, recovery, antiscalant, trends, alerts. You can answer about any of them regardless of currentPage. currentPage is the page the operator is viewing, so questions like "what does this mean" or "is this normal" usually refer to that section.
 - If system.dataAvailable is false, no live PLC data has been received yet. Say so instead of reporting values.
+- Pump and dosing states in the system section come straight from the PLC bits. system.runHours_hrs is the total service run hours and system.dailyRunHours_hrs is today's run hours.
 - system.systemActive is the master ON/OFF. If false, the system is OFF regardless of anything else. system.operationMode is OFF, STANDBY, FILTER or BACKWASH; modeReason explains why it is OFF or in STANDBY. controlMode (AUTO/MANUAL) is separate from operationMode.
 - production.live holds current flow rates (m³/h). production.totals holds produced volumes in m³ (daily, weekly, monthly, yearly) for feed and permeate. "Production" usually means permeate. If totals.available is false, say the totals are temporarily unavailable.
 - production.targets holds the targets configured on the Settings page. The unit of productionTarget is not recorded, so quote it as configured and do not compute percentages against it unless the operator states the unit. recovery.target_pct is the recovery target.
 - trends.windows.last1h and last24h summarize stored measurements per tag (min, max, avg, first, last, change, direction, samples). Use them to describe trends ("rising", "falling", "stable") and ranges. If samples is small, say the data for that window is limited. If trends.available is false, say trend data is temporarily unavailable. Do not extrapolate beyond the windows given.
-- alerts.activeAlarms is the complete list of alarms the web Alerts Center shows. Only a low feed tank level alarm is monitored. If it is empty, say there are no active alarms. Do not claim other alarms exist.
+- alerts.activeAlarms is the complete list of alarms the web Alerts Center shows. Only three types are monitored: Power Problem, Feed Tank Low Signal (the PLC low-level bit, shown with the tank %) and PLC Data Lost. If it is empty, say there are no active alarms. Do not claim other alarms exist.
 - Limits in the context (recovery, delta pressure, mass balance) are reference limits, not alarms. You may say a value is beyond a limit, but say it is a limit and not an active alarm unless it appears in alerts.activeAlarms.
-- filtration.plcBits are informational PLC flags. Mention them if relevant, but they are not alarms on the web.
+- filtration.plcBits are PLC flags. Only powerProblem raises a web alarm; mention the others if relevant but do not call them alarms.
 - Feed tank level is calibrated from the raw transmitter signal (0% = empty, 100% = full).
 - The "unavailable" list is data you do not have. If asked about those, say you don't have that data yet. Do not estimate it.
 

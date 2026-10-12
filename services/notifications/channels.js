@@ -26,10 +26,11 @@ const EMAIL_BATCH_SIZE = Math.max(1, Number(process.env.EMAIL_BATCH_SIZE) || 50)
 async function resolveRecipients(explicit) {
   if (Array.isArray(explicit) && explicit.length) return explicit;
 
+  // Generic alert emails go to staff only (operators/admins).
   try {
-    const { getEmailRecipients } = require('./recipients');
-    const dbUsers = await getEmailRecipients(console);
-    if (dbUsers && dbUsers.length) return dbUsers;
+    const { getRecipientsByTier } = require('./recipients');
+    const tiers = await getRecipientsByTier(console);
+    if (tiers && tiers.staff && tiers.staff.length) return tiers.staff;
   } catch (err) {
     console.error(`[channels] recipients lookup failed: ${err.message}`);
   }
@@ -37,33 +38,132 @@ async function resolveRecipients(explicit) {
   return config.email.to || [];
 }
 
-// One email per alert batch: single alert → own subject, burst → digest.
-// `recipients` overrides the DB lookup when provided.
-async function sendEmail(tasks, recipients = null) {
-  const { from } = config.email;
+// ───────────────── Tiered delivery: staff vs clients ─────────────────
+// Staff (operators/admins): every email.
+// Clients: at most CLIENT_MAX_EMAILS_PER_DAY emails per calendar day
+// (plant time zone). The counter lives in the database, so restarts and
+// deploys cannot reset it.
+const CLIENT_MAX_PER_DAY = Math.max(0, Number(process.env.CLIENT_MAX_EMAILS_PER_DAY ?? 2));
+let counterTableReady = false;
 
-  const list = await resolveRecipients(recipients);
+const clientDayKey = () =>
+  new Date().toLocaleDateString('en-CA', { timeZone: config.calendar.timeZone });
 
-  if (!list.length) {
-    throw new Error(
-      'No email recipients: no DB users and ALERT_EMAIL_TO is empty.'
+function getDbPool() {
+  return require('../../database/postgres').getPool();
+}
+
+async function ensureCounterTable() {
+  if (counterTableReady) return;
+  await getDbPool().query(`
+    CREATE TABLE IF NOT EXISTS client_email_counter (
+      day  TEXT PRIMARY KEY,
+      sent INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  counterTableReady = true;
+}
+
+// Atomically takes one of today's client email slots.
+// Fails closed: if the database is unreachable, clients get no email.
+async function claimClientEmailSlot() {
+  if (CLIENT_MAX_PER_DAY <= 0) return { ok: false, used: 0 };
+  try {
+    await ensureCounterTable();
+    const r = await getDbPool().query(
+      `INSERT INTO client_email_counter (day, sent) VALUES ($1, 1)
+       ON CONFLICT (day) DO UPDATE SET sent = client_email_counter.sent + 1
+       WHERE client_email_counter.sent < $2
+       RETURNING sent`,
+      [clientDayKey(), CLIENT_MAX_PER_DAY]
     );
+    if (r.rows.length) return { ok: true, used: r.rows[0].sent };
+    return { ok: false, used: CLIENT_MAX_PER_DAY };
+  } catch (err) {
+    console.error(`[channels] client email counter failed: ${err.message}`);
+    return { ok: false, used: 0 };
+  }
+}
+
+async function releaseClientEmailSlot() {
+  try {
+    await getDbPool().query(
+      `UPDATE client_email_counter SET sent = GREATEST(sent - 1, 0) WHERE day = $1`,
+      [clientDayKey()]
+    );
+  } catch (err) {
+    console.error(`[channels] could not release client email slot: ${err.message}`);
+  }
+}
+
+async function resolveTiers() {
+  try {
+    const { getRecipientsByTier } = require('./recipients');
+    const tiers = await getRecipientsByTier(console);
+    return { staff: tiers.staff || [], clients: tiers.clients || [] };
+  } catch (err) {
+    console.error(`[channels] tiered recipients lookup failed: ${err.message}`);
+    return { staff: config.email.to || [], clients: [] };
+  }
+}
+
+// Sends one prepared email to staff (always) and to clients (if under the
+// daily limit).
+async function sendTiered({ subject, text, html, label }, tiers) {
+  const { from } = config.email;
+  const errors = [];
+
+  if (tiers.staff.length) {
+    try {
+      await withRetry(() => getMailer().sendMail({ from, to: from, bcc: tiers.staff, subject, text, html }));
+      console.log(`[channels] ${label} email sent to ${tiers.staff.length} staff recipient(s)`);
+    } catch (err) {
+      errors.push(err);
+      console.error(`[channels] ${label} staff email failed: ${err.message}`);
+    }
   }
 
-  const sorted = [...tasks].sort((a, b) => rank(b.severity) - rank(a.severity));
-  const top = sorted[0];
+  if (tiers.clients.length) {
+    const slot = await claimClientEmailSlot();
+    if (slot.ok) {
+      try {
+        await withRetry(() => getMailer().sendMail({ from, to: from, bcc: tiers.clients, subject, text, html }));
+        console.log(`[channels] ${label} email sent to ${tiers.clients.length} client(s) (${slot.used}/${CLIENT_MAX_PER_DAY} today)`);
+      } catch (err) {
+        await releaseClientEmailSlot();
+        errors.push(err);
+        console.error(`[channels] ${label} client email failed: ${err.message}`);
+      }
+    } else {
+      console.log(`[channels] ${label} email NOT sent to clients — daily limit reached (${CLIENT_MAX_PER_DAY}/day)`);
+    }
+  }
 
-  const subject =
-    sorted.length === 1
+  if (errors.length) throw errors[0];
+}
+
+// Alert types clients may be emailed about (still subject to the daily cap).
+const CLIENT_EMAIL_TYPES = (process.env.CLIENT_EMAIL_TYPES || 'Low Feed Tank Level')
+  .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+
+function buildEmailContent(sorted) {
+  const top = sorted[0];
+  const isReminder = sorted.every((t) => t.reminder);
+
+  const subject = isReminder
+    ? `RO Plant Reminder ${top.title}`
+    : sorted.length === 1
       ? `RO Plant Alert ${top.title}`
       : `RO Plant Alert ${sorted.length} new alerts`;
+
+  const when = (t) => (t.reminder ? 'Still active since' : 'Raised');
 
   const text = sorted
     .map(
       (t) =>
-`• [${t.severity}] ${t.title}
+`• [${t.severity}] ${t.title}${t.reminder ? ' (REMINDER - still active)' : ''}
   ${t.message || t.equipment || ''}${t.value !== undefined ? ` (value: ${t.value})` : ''}
-  Raised: ${fmtTime(t.startedAt)}
+  ${when(t)}: ${fmtTime(t.startedAt)}
   Maintenance task: ${t.action}
   Ref: ${t.cycleId}`
     )
@@ -73,15 +173,19 @@ async function sendEmail(tasks, recipients = null) {
     .map(
       (t) =>
 `<div style="margin-bottom:14px">
-  <b>[${esc(t.severity)}] ${esc(t.title)}</b><br>
+  <b>[${esc(t.severity)}] ${esc(t.title)}${t.reminder ? ' <span style="color:#b45309">(REMINDER - still active)</span>' : ''}</b><br>
   ${esc(t.message || t.equipment || '')}${t.value !== undefined ? ` <i>(value: ${esc(t.value)})</i>` : ''}<br>
-  <small>Raised ${esc(fmtTime(t.startedAt))} · Ref ${esc(t.cycleId)}</small><br>
+  <small>${esc(when(t))} ${esc(fmtTime(t.startedAt))} · Ref ${esc(t.cycleId)}</small><br>
   <b>Maintenance task:</b> ${esc(t.action)}
 </div>`
     )
     .join('')}</div>`;
 
-  // Split into batches to respect SMTP provider limits.
+  return { subject, text, html };
+}
+
+async function sendInBatches(list, content) {
+  const { from } = config.email;
   const batches = [];
   for (let i = 0; i < list.length; i += EMAIL_BATCH_SIZE) {
     batches.push(list.slice(i, i + EMAIL_BATCH_SIZE));
@@ -91,13 +195,83 @@ async function sendEmail(tasks, recipients = null) {
   for (const bcc of batches) {
     try {
       // "to" is the sender; the real recipients are all in BCC.
-      await withRetry(() => getMailer().sendMail({ from, to: from, bcc, subject, text, html }));
+      await withRetry(() => getMailer().sendMail({ from, to: from, bcc, ...content }));
     } catch (err) {
       failed += 1;
       console.error(`[channels] email batch of ${bcc.length} failed: ${err.message}`);
     }
   }
   if (failed) throw new Error(`${failed} of ${batches.length} email batch(es) failed`);
+}
+
+// Alert emails.
+//   Staff (operators/admins): every alert, plus reminders.
+//   Clients: only CLIENT_EMAIL_TYPES, never reminders, and at most
+//            CLIENT_MAX_EMAILS_PER_DAY emails per day.
+// `recipients` (explicit list) overrides the tiers and goes to staff only.
+async function sendEmail(tasks, recipients = null) {
+  const tiers =
+    Array.isArray(recipients) && recipients.length
+      ? { staff: recipients, clients: [] }
+      : await resolveTiers();
+
+  if (!tiers.staff.length && !tiers.clients.length) {
+    throw new Error('No email recipients: no DB users and ALERT_EMAIL_TO is empty.');
+  }
+
+  const rank_ = (t) => rank(t.severity);
+  const sortTasks = (ts) => [...ts].sort((a, b) => rank_(b) - rank_(a));
+  const errors = [];
+
+  // Staff: everything.
+  if (tiers.staff.length) {
+    try {
+      await sendInBatches(tiers.staff, buildEmailContent(sortTasks(tasks)));
+    } catch (err) {
+      errors.push(err);
+    }
+  }
+
+  // Clients: limited types, no reminders, daily cap.
+  const clientTasks = tasks.filter(
+    (t) => !t.reminder && CLIENT_EMAIL_TYPES.includes(String(t.title || '').trim().toLowerCase())
+  );
+
+  if (tiers.clients.length && clientTasks.length) {
+    const slot = await claimClientEmailSlot();
+    if (slot.ok) {
+      try {
+        await sendInBatches(tiers.clients, buildEmailContent(sortTasks(clientTasks)));
+        console.log(`[channels] alert email sent to ${tiers.clients.length} client(s) (${slot.used}/${CLIENT_MAX_PER_DAY} today)`);
+      } catch (err) {
+        await releaseClientEmailSlot();
+        errors.push(err);
+      }
+    } else {
+      console.log(`[channels] alert email NOT sent to clients — daily limit reached (${CLIENT_MAX_PER_DAY}/day)`);
+    }
+  }
+
+  if (errors.length) throw errors[0];
+}
+
+// "Alarm cleared" email: staff only.
+async function sendClearedEmail(info) {
+  const tiers = await resolveTiers();
+  if (!tiers.staff.length) return;
+
+  const { title, severity, equipment, startedAt, clearedAt, minutes } = info;
+  const subject = `RO Plant Cleared ${title}`;
+  const text =
+`[${severity || 'Info'}] ${title} has cleared.
+${equipment ? `Equipment: ${equipment}\n` : ''}Raised: ${fmtTime(new Date(startedAt))}
+Cleared: ${fmtTime(new Date(clearedAt))}${minutes ? ` (after ${minutes} min)` : ''}`;
+  const html = `<div style="font-family:sans-serif;font-size:14px">
+  <b>[${esc(severity || 'Info')}] ${esc(title)} has cleared.</b><br>
+  ${equipment ? `${esc(equipment)}<br>` : ''}<small>Raised ${esc(fmtTime(new Date(startedAt)))} · Cleared ${esc(fmtTime(new Date(clearedAt)))}${minutes ? ` (after ${minutes} min)` : ''}</small>
+</div>`;
+
+  await sendInBatches(tiers.staff, { subject, text, html });
 }
 
 // ───────────────────────── Slack (Web API) ─────────────────────────
@@ -219,7 +393,7 @@ async function sendTankEmptyNotification(info) {
     (tankLevel !== undefined ? ` Current tank level: ${Number(tankLevel).toFixed(1)}%.` : '') +
     (currentMode ? ` Current mode: ${currentMode}.` : '');
 
-   const recipients = await resolveRecipients(null);
+   const tiers = await resolveTiers();
   const { from } = config.email;
 
   const action = actionFor('Low Feed Tank Level');
@@ -227,7 +401,7 @@ async function sendTankEmptyNotification(info) {
     `${slug('RO5-FeedTankLevel')}-standby-` +
     startedAt.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
 
-  if (recipients.length && config.email.enabled !== false) {
+  if ((tiers.staff.length || tiers.clients.length) && config.email.enabled !== false) {
     const subject = 'RO Plant Alert- Feed Tank Low';
 
     const text =
@@ -246,8 +420,7 @@ Maintenance task: ${action}`;
   <div style="margin-top:8px"><b>Maintenance task:</b> ${esc(action)}</div>
 </div>`;
 
-    await withRetry(() => getMailer().sendMail({ from, to: from, bcc: recipients, subject, text, html }));
-    console.log(`[channels] tank-empty email sent to ${recipients.length} recipient(s)`);
+    await sendTiered({ subject, text, html, label: 'tank-empty' }, tiers);
   } else {
     console.warn('[channels] tank-empty email skipped — no recipients');
   }
@@ -272,7 +445,7 @@ async function sendBackwashNotification(info) {
     (mediaPressure !== undefined ? ` (${Number(mediaPressure).toFixed(2)} bar)` : '') +
     (previousMode ? `. Previous mode: ${previousMode}.` : '.');
 
-   const recipients = await resolveRecipients(null);
+   const tiers = await resolveTiers();
   const { from } = config.email;
 
   const action = actionFor('High Media Filter Differential Pressure');
@@ -280,7 +453,7 @@ async function sendBackwashNotification(info) {
     `${slug('RO5-Backwash')}-` +
     startedAt.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
 
-  if (recipients.length && config.email.enabled !== false) {
+  if ((tiers.staff.length || tiers.clients.length) && config.email.enabled !== false) {
     const subject = `RO Plant: ${title}`;
 
     const text =
@@ -299,8 +472,7 @@ Maintenance task: ${action}`;
   <div style="margin-top:8px"><b>Maintenance task:</b> ${esc(action)}</div>
 </div>`;
 
-    await withRetry(() => getMailer().sendMail({ from, to: from, bcc: recipients, subject, text, html }));
-    console.log(`[channels] backwash email sent to ${recipients.length} recipient(s)`);
+    await sendTiered({ subject, text, html, label: 'backwash' }, tiers);
   } else {
     console.warn('[channels] backwash email skipped — no recipients');
   }
@@ -315,6 +487,7 @@ Maintenance task: ${action}`;
 
 module.exports = {
   sendEmail,
+  sendClearedEmail,
   postSlackAlert,
   postSlackText,
   createCalendarEvent,

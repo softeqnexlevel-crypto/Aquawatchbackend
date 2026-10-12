@@ -5,7 +5,11 @@
 //   ALERT_RECIPIENT_MODE=all        every active, non-deleted user (default)
 //   ALERT_RECIPIENT_MODE=signed_in  only users holding a valid login session
 //                                   (non-revoked, unexpired refresh token)
-//   ALERT_RECIPIENT_ROLES=admin,operator   optional role filter
+//   ALERT_RECIPIENT_ROLES=admin,operator   optional role filter (used by
+//                                   getEmailRecipients only)
+//
+//   STAFF_ROLES=admin,operator      roles that get EVERY alert + reminders
+//   CLIENT_ROLES=client             roles that get the limited client emails
 //
 // A user can opt out by setting preferences.emailAlerts = false.
 'use strict';
@@ -14,6 +18,15 @@ const config = require('./config');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 let cache = { at: 0, list: null };
+let tierCache = { at: 0, value: null };
+
+function parseRoles(value, fallback) {
+  const raw = (value || fallback || '').toString();
+  return raw
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
 
 async function queryUsers() {
   const { sql } = require('drizzle-orm');
@@ -64,4 +77,48 @@ async function getEmailRecipients(logger = console) {
   return list;
 }
 
-module.exports = { getEmailRecipients };
+// Splits recipients into two groups:
+//   staff   -> operators/admins: every alert, plus reminders
+//   clients -> limited emails (daily cap applied by the notifier)
+async function getRecipientsByTier(logger = console) {
+  if (tierCache.value && Date.now() - tierCache.at < config.recipients.cacheMs) {
+    return tierCache.value;
+  }
+
+  const staffRoles = parseRoles(process.env.STAFF_ROLES, 'admin,operator');
+  const clientRoles = parseRoles(process.env.CLIENT_ROLES, 'client');
+
+  try {
+    const rows = await queryUsers();
+    const staff = new Set();
+    const clients = new Set();
+
+    for (const u of rows) {
+      if (u.preferences && u.preferences.emailAlerts === false) continue;
+      const email = String(u.email || '').trim().toLowerCase();
+      if (!EMAIL_RE.test(email)) continue;
+      const role = String(u.role || '').toLowerCase();
+
+      if (staffRoles.includes(role)) staff.add(email);
+      else if (clientRoles.includes(role)) clients.add(email);
+    }
+
+    // Never email the same address in both groups.
+    for (const e of staff) clients.delete(e);
+
+    let staffList = [...staff];
+    if (!staffList.length) {
+      logger.warn?.('[alert-notifier] no staff users to email — using ALERT_EMAIL_TO fallback');
+      staffList = config.email.to;
+    }
+
+    const value = { staff: staffList, clients: [...clients] };
+    tierCache = { at: Date.now(), value };
+    return value;
+  } catch (err) {
+    logger.error?.(`[alert-notifier] tiered recipients lookup failed: ${err.message}`);
+    return tierCache.value || { staff: config.email.to, clients: [] };
+  }
+}
+
+module.exports = { getEmailRecipients, getRecipientsByTier };

@@ -1,7 +1,7 @@
 // backend/routes/settings.routes.js
 const express = require('express');
 const router = express.Router();
-const db = require('../database/postgres');
+const db = require('./database/postgres');
 const authMiddleware = require('../middleware/auth.middleware');
 
 // GET /api/settings — any authenticated user can view current settings
