@@ -65,6 +65,7 @@ app.locals.dbReady = false;
 
 // ==================== API ROUTES ====================
 
+app.use("/api/daily-summary", require("./routes/dailySummary.routes"));
 app.use("/api", apiRoutes);
 
 // ==================== 404 HANDLER ====================
@@ -110,6 +111,7 @@ const io = new Server(server, {
   // --------------------------------------------------
   try {
     await initDb();
+    try { await require("./services/dailySummary").start(); } catch (e) { console.error("[dailySummary] start failed:", e.message); }
     app.locals.dbReady = true;
     console.log("[db] Database initialized successfully");
 
