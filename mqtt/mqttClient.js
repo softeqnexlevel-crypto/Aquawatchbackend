@@ -1,5 +1,4 @@
 const mqtt = require("mqtt");
-
 const { handleIncoming } = require("../services/plcParser");
 
 let client = null;
@@ -174,4 +173,4 @@ function getDataPointCount() {
   }
 }
 
-module.exports = { initMqtt, publish, getStatus };
+module.exports = { initMqtt, publish, getStatus, closeMqtt };
