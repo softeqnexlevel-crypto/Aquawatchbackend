@@ -10,7 +10,7 @@ const express = require("express");
 const cors = require("cors");
 const { Server } = require("socket.io");
 
-const { initMqtt, getStatus } = require("./mqtt/mqttClient");
+const { initMqtt, getStatus, closeMqtt } = require("./mqtt/mqttClient");
 const {
   initSocket,
   broadcastMqttStatus,
@@ -204,10 +204,37 @@ server.on("error", (err) => {
 
 // ==================== GRACEFUL SHUTDOWN ====================
 
+let shuttingDown = false;
+
 function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
   console.log(
     `\n[server] ${signal} received — shutting down gracefully...`
   );
+
+  // Safety net: never wait more than 5 seconds for connections to drain.
+  setTimeout(() => {
+    console.warn("[server] Shutdown timed out — forcing exit");
+    process.exit(0);
+  }, 5000);
+
+  // Stop receiving PLC data first so a leftover copy can't keep
+  // processing packets or sending alert emails.
+  try {
+    closeMqtt();
+  } catch (err) {
+    console.error("[server] error closing MQTT:", err.message);
+  }
+
+  // Disconnect Socket.IO clients (this also closes the HTTP server).
+  try {
+    io.close();
+  } catch (err) {
+    console.error("[server] error closing Socket.IO:", err.message);
+  }
+
   server.close(() => {
     console.log("[server] Server closed");
     process.exit(0);

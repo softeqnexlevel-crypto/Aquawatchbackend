@@ -125,6 +125,23 @@ function initMqtt() {
   startWatchdog();
 }
 
+function closeMqtt() {
+  stopping = true;
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+  if (client) {
+    try {
+      client.end(true);
+    } catch (err) {
+      console.error("[mqtt] error closing client:", err.message);
+    }
+    client = null;
+  }
+  console.log("[mqtt] closed for shutdown");
+}
+
 function publish(topic, value) {
   try {
     const payload = typeof value === "object" ? JSON.stringify(value) : String(value);
