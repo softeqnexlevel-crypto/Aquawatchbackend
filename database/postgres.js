@@ -1,7 +1,7 @@
 // database/postgres.js
 const { drizzle } = require('drizzle-orm/node-postgres');
 const { Pool } = require('pg');
-const { sql } = require('drizzle-orm');
+const { sql, and, desc, asc } = require('drizzle-orm');
 const { v4: uuidv4 } = require('uuid');
 const schema = require('../db/schema');
 
@@ -35,13 +35,14 @@ async function initDb() {
             query_timeout: 30000,
         });
 
+        pool.on('error', (err) => {
+            console.error('[DB] Pool error:', err.message);
+        });
+
         await pool.query('SELECT 1');
         console.log('[DB] Connected to PostgreSQL');
         
         await ensureAlertEventsTable();
-        pool.on('error', (err) => {
-            console.error('[DB] Pool error:', err.message);
-        });
 
         pool.on('connect', () => {
             console.log('[DB] New connection established');
@@ -203,16 +204,13 @@ async function deleteUser(id, hardDelete = false) {
 
 async function getAllUsers(organizationId = null) {
     const db = getDb();
-    let query = db.select()
+    const conds = [sql`${schema.users.deletedAt} IS NULL`];
+    if (organizationId) conds.push(sql`${schema.users.organizationId} = ${organizationId}`);
+
+    return db.select()
         .from(schema.users)
-        .where(sql`${schema.users.deletedAt} IS NULL`)
-        .orderBy(schema.users.createdAt, 'desc');
-
-    if (organizationId) {
-        query = query.where(sql`${schema.users.organizationId} = ${organizationId}`);
-    }
-
-    return query;
+        .where(and(...conds))
+        .orderBy(desc(schema.users.createdAt));
 }
 
 // ============================================================
@@ -300,7 +298,7 @@ async function getLatestMeasurement(parameter) {
     const result = await db.select()
         .from(schema.measurements)
         .where(sql`${schema.measurements.parameter} = ${parameter}`)
-        .orderBy(schema.measurements.time, 'desc')
+        .orderBy(desc(schema.measurements.time))
         .limit(1);
     return result[0] || null;
 }
@@ -318,9 +316,13 @@ async function getMeasurementHistory(parameter, hours = 24, limit = 1000) {
 
 async function getMeasurementAggregates(parameter, bucket = '1 hour', hours = 24) {
     const db = getDb();
+    // Plain Postgres (no TimescaleDB): bucket by date_trunc. Whitelist the unit.
+    const unit = String(bucket).replace(/^\d+\s*/, '').replace(/s$/, '').toLowerCase();
+    const trunc = ['minute', 'hour', 'day', 'week', 'month'].includes(unit) ? unit : 'hour';
+    const h = Math.max(1, Math.min(Number(hours) || 24, 24 * 365));
     return db.execute(sql`
         SELECT
-            time_bucket(${bucket}, time) AS bucket,
+            date_trunc(${trunc}, time) AS bucket,
             AVG(value) AS avg_value,
             MIN(value) AS min_value,
             MAX(value) AS max_value,
@@ -328,7 +330,7 @@ async function getMeasurementAggregates(parameter, bucket = '1 hour', hours = 24
             COUNT(*) AS sample_count
         FROM measurements
         WHERE parameter = ${parameter}
-            AND time > NOW() - INTERVAL ${hours + ' hours'}
+            AND time > NOW() - (${h} * INTERVAL '1 hour')
         GROUP BY bucket
         ORDER BY bucket DESC
     `);
@@ -434,16 +436,13 @@ async function createAlert(data) {
 
 async function getActiveAlerts(organizationId = null) {
     const db = getDb();
-    let query = db.select()
+    const conds = [sql`${schema.alerts.resolved} = false`];
+    if (organizationId) conds.push(sql`${schema.alerts.organizationId} = ${organizationId}`);
+
+    return db.select()
         .from(schema.alerts)
-        .where(sql`${schema.alerts.resolved} = false`)
-        .orderBy(schema.alerts.createdAt, 'desc');
-
-    if (organizationId) {
-        query = query.where(sql`${schema.alerts.organizationId} = ${organizationId}`);
-    }
-
-    return query;
+        .where(and(...conds))
+        .orderBy(desc(schema.alerts.createdAt));
 }
 
 async function acknowledgeAlert(id, userId, note = null) {
@@ -507,16 +506,13 @@ async function getDevice(id) {
 
 async function getAllDevices(organizationId = null) {
     const db = getDb();
-    let query = db.select()
+    const conds = [sql`${schema.devices.isActive} = true`];
+    if (organizationId) conds.push(sql`${schema.devices.organizationId} = ${organizationId}`);
+
+    return db.select()
         .from(schema.devices)
-        .where(sql`${schema.devices.isActive} = true`)
-        .orderBy(schema.devices.name);
-
-    if (organizationId) {
-        query = query.where(sql`${schema.devices.organizationId} = ${organizationId}`);
-    }
-
-    return query;
+        .where(and(...conds))
+        .orderBy(asc(schema.devices.name));
 }
 
 async function createTag(data) {
@@ -547,7 +543,7 @@ async function getTagsByDevice(deviceId) {
     return db.select()
         .from(schema.tags)
         .where(sql`${schema.tags.deviceId} = ${deviceId} AND ${schema.tags.isActive} = true`)
-        .orderBy(schema.tags.order, 'asc');
+        .orderBy(asc(schema.tags.order));
 }
 
 // ============================================================
@@ -571,16 +567,13 @@ async function logAction(userId, action, resource, resourceId = null, details = 
 
 async function getAuditLogs(organizationId = null, limit = 100) {
     const db = getDb();
-    let query = db.select()
-        .from(schema.auditLogs)
-        .orderBy(schema.auditLogs.createdAt, 'desc')
-        .limit(limit);
+    let query = db.select().from(schema.auditLogs);
 
     if (organizationId) {
         query = query.where(sql`${schema.auditLogs.organizationId} = ${organizationId}`);
     }
 
-    return query;
+    return query.orderBy(desc(schema.auditLogs.createdAt)).limit(limit);
 }
 
 // ============================================================
@@ -609,15 +602,12 @@ async function createAlertRule(data) {
 
 async function getActiveAlertRules(organizationId = null) {
     const db = getDb();
-    let query = db.select()
+    const conds = [sql`${schema.alertRules.isActive} = true`];
+    if (organizationId) conds.push(sql`${schema.alertRules.organizationId} = ${organizationId}`);
+
+    return db.select()
         .from(schema.alertRules)
-        .where(sql`${schema.alertRules.isActive} = true`);
-
-    if (organizationId) {
-        query = query.where(sql`${schema.alertRules.organizationId} = ${organizationId}`);
-    }
-
-    return query;
+        .where(and(...conds));
 }
 
 // ============================================================
@@ -735,7 +725,7 @@ async function getDosingHistoryForMonth(month) {
   return db.select()
     .from(schema.dosingTotals)
     .where(sql`${schema.dosingTotals.month} = ${month}`)
-    .orderBy(schema.dosingTotals.day, 'asc');
+    .orderBy(asc(schema.dosingTotals.day));
 }
 
 async function getDosingCurrentMonthTotal() {
@@ -806,7 +796,7 @@ async function getBillingHistoryByUser(userId, limit = 50) {
     return db.select()
         .from(schema.billingHistory)
         .where(sql`${schema.billingHistory.userId} = ${userId}`)
-        .orderBy(schema.billingHistory.purchaseDate, 'desc')
+        .orderBy(desc(schema.billingHistory.purchaseDate))
         .limit(limit);
 }
 
