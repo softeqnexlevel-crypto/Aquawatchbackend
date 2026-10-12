@@ -54,6 +54,10 @@ async function initDb() {
 
         initialized = true;
 
+        // Automatic data retention: first run 2 minutes after start, then daily
+        setTimeout(cleanupOldData, 2 * 60 * 1000);
+        setInterval(cleanupOldData, 24 * 60 * 60 * 1000);
+
         if (process.env.NODE_ENV === 'production') {
             setInterval(async () => {
                 try {
@@ -76,6 +80,24 @@ function getDb() {
         throw new Error('Database not initialized. Call initDb() first.');
     }
     return db;
+}
+
+async function cleanupOldData() {
+    const measDays = parseInt(process.env.MEASUREMENTS_RETENTION_DAYS) || 400;
+    const alertDays = parseInt(process.env.ALERT_EVENTS_RETENTION_DAYS) || 180;
+    try {
+        const m = await pool.query(
+            `DELETE FROM measurements WHERE time < NOW() - ($1 * INTERVAL '1 day')`,
+            [measDays]
+        );
+        const a = await pool.query(
+            `DELETE FROM alert_events WHERE time < NOW() - ($1 * INTERVAL '1 day')`,
+            [alertDays]
+        );
+        console.log(`[DB] Cleanup: removed ${m.rowCount} old measurements, ${a.rowCount} old alert events`);
+    } catch (err) {
+        console.error('[DB] Cleanup failed:', err.message);
+    }
 }
 
 function getPool() {
