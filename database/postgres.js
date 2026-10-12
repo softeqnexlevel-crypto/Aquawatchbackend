@@ -285,10 +285,12 @@ async function getLatestMeasurement(parameter) {
 
 async function getMeasurementHistory(parameter, hours = 24, limit = 1000) {
     const db = getDb();
+    const h = Math.max(1, Math.min(Number(hours) || 24, 24 * 365));
     return db.select()
         .from(schema.measurements)
-        .where(sql`${schema.measurements.parameter} = ${parameter} AND ${schema.measurements.time} > NOW() - INTERVAL '${hours} hours'`)
-        .orderBy(schema.measurements.time, 'asc')
+        .where(sql`${schema.measurements.parameter} = ${parameter}
+            AND ${schema.measurements.time} > NOW() - (${h} * INTERVAL '1 hour')`)
+        .orderBy(sql`${schema.measurements.time} asc`)
         .limit(limit);
 }
 
