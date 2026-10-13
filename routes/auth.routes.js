@@ -150,16 +150,21 @@ router.put('/users/:userId',
                 return res.status(400).json({ error: 'Cannot deactivate your own account' });
             }
 
+            const meta = { actorId: req.user.id, ip: req.ip, userAgent: req.headers['user-agent'] };
             const user = await authService.updateUser(userId, {
                 firstName, lastName, role, isActive, phone,
                 ...(Array.isArray(permissions) ? { permissions } : {}),
-            });
+            }, meta);
 
-            await authService.logAction(
-                req.user.id, 'user_updated', 'user', userId,
-                { role, isActive, phone },
-                req.ip, req.headers['user-agent']
-            );
+            // Pause/resume is already logged (with the admin's name) by the service
+            const onlyStatusChange = Object.keys(req.body || {}).every((k) => k === 'isActive');
+            if (!onlyStatusChange) {
+                await authService.logAction(
+                    req.user.id, 'user_updated', 'user', userId,
+                    { role, isActive, phone },
+                    req.ip, req.headers['user-agent']
+                );
+            }
 
             res.json({ message: 'User updated successfully', user });
         } catch (error) {
@@ -178,7 +183,7 @@ router.delete('/users/:userId',
             if (userId === req.user.id) {
                 return res.status(400).json({ error: 'Cannot delete yourself' });
             }
-            await authService.deleteUser(userId);
+            await authService.deleteUser(userId, { actorId: req.user.id });
             await authService.logAction(
                 req.user.id, 'user_deleted', 'user', userId, {},
                 req.ip, req.headers['user-agent']

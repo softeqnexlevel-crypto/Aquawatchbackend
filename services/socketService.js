@@ -1,11 +1,46 @@
 // backend/services/socketService.js
 let ioRef = null;
 
+// SOCKET_REQUIRE_AUTH=true  -> connections without a valid login token are rejected.
+// Leave it unset until the website sends the token (see DataContext), otherwise
+// the live data would stop for everyone.
+const REQUIRE_AUTH = String(process.env.SOCKET_REQUIRE_AUTH || '').toLowerCase() === 'true';
+
 function initSocket(io) {
   ioRef = io;
   console.log('[socket] ✅ Socket.IO initialized');
-  
-  // ✅ ADD THIS - Log all connections
+  console.log(`[socket] auth required: ${REQUIRE_AUTH}`);
+
+  // ── Login check ────────────────────────────────────────────────
+  // Token is sent by the browser as io(url, { auth: { token } }).
+  // A token that belongs to a paused user is always refused; an expired/invalid one is
+  // refused only when SOCKET_REQUIRE_AUTH=true.
+  io.use(async (socket, next) => {
+    const token = socket.handshake.auth && socket.handshake.auth.token;
+    if (!token) {
+      if (REQUIRE_AUTH) return next(new Error('AUTH_REQUIRED'));
+      return next();
+    }
+    try {
+      const pasetoService = require('./paseto.service');
+      const authService = require('./auth.service');
+      const payload = await pasetoService.verifyAccessToken(token);
+      if (!payload) {
+        // Expired/invalid token: refuse only when auth is enforced. Otherwise treat as
+        // anonymous so a user whose token is mid-refresh does not lose live data.
+        return REQUIRE_AUTH ? next(new Error('AUTH_INVALID')) : next();
+      }
+      const user = await authService.getUserById(payload.sub);
+      if (!user) return REQUIRE_AUTH ? next(new Error('AUTH_INVALID')) : next();
+      if (!user.isActive) return next(new Error('ACCOUNT_PAUSED'));
+      socket.data.userId = user.id;
+      return next();
+    } catch (err) {
+      console.error('[socket] auth error:', err.message);
+      return next(new Error('AUTH_FAILED'));
+    }
+  });
+
   io.engine.on("connection", (socket) => {
     console.log('[socket] 🔌 Engine connection from:', socket.request.headers.origin);
   });
@@ -28,12 +63,11 @@ function initSocket(io) {
 
     // Send latest data
     try {
-      // const { getLatestFull } = require("./plcService");
       const { getLatestFull } = require("./plcParser");
       const latest = getLatestFull();
       const keys = Object.keys(latest);
       console.log(`[socket] 📊 Sending ${keys.length} readings to client`);
-      
+
       keys.forEach(key => {
         socket.emit("plc-data", latest[key]);
       });
@@ -41,10 +75,10 @@ function initSocket(io) {
       console.error('[socket] Error sending latest data:', err.message);
     }
 
-    // ✅ ADD THIS - Force send data on request
+    // Force send data on request
     socket.on("get-latest-data", () => {
       try {
-        const { getLatestFull } = require("./plcService");
+        const { getLatestFull } = require("./plcParser");
         const latest = getLatestFull();
         console.log(`[socket] 📊 Sending ${Object.keys(latest).length} readings on request`);
         Object.values(latest).forEach(record => {
@@ -60,11 +94,6 @@ function initSocket(io) {
       console.log(`[socket] 📊 Remaining clients: ${io.sockets.sockets.size}`);
     });
   });
-
-  // ✅ ADD THIS - Log errors
-  io.on("connect_error", (err) => {
-    console.error('[socket] ❌ Connection error:', err.message);
-  });
 }
 
 function broadcast(event, payload) {
@@ -72,7 +101,7 @@ function broadcast(event, payload) {
     console.warn('[socket] ⚠️ Cannot broadcast - ioRef is null');
     return false;
   }
-  
+
   try {
     ioRef.emit(event, payload);
     return true;
@@ -92,7 +121,25 @@ function broadcastMqttStatus() {
   }
 }
 
-// ✅ ADD THIS
+// Cuts off every live connection that belongs to a user (used when they are paused/deleted).
+function disconnectUser(userId) {
+  if (!ioRef || !userId) return 0;
+  let n = 0;
+  for (const socket of ioRef.sockets.sockets.values()) {
+    if (socket.data && socket.data.userId === userId) {
+      try {
+        socket.emit('account-paused');
+        socket.disconnect(true);
+        n++;
+      } catch (err) {
+        console.error('[socket] disconnectUser error:', err.message);
+      }
+    }
+  }
+  if (n) console.log(`[socket] disconnected ${n} connection(s) for user ${userId}`);
+  return n;
+}
+
 function getSocketStatus() {
   return {
     hasIo: !!ioRef,
@@ -100,4 +147,4 @@ function getSocketStatus() {
   };
 }
 
-module.exports = { initSocket, broadcast, broadcastMqttStatus, getSocketStatus };
+module.exports = { initSocket, broadcast, broadcastMqttStatus, getSocketStatus, disconnectUser };

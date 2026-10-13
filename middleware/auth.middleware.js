@@ -24,10 +24,18 @@ class AuthMiddleware {
                 });
             }
 
+            // Checked on every request, so a paused user loses access immediately
+            // (not when their token expires).
             const user = await authService.getUserById(payload.sub);
-            if (!user || !user.isActive) {
+            if (!user) {
                 return res.status(401).json({
-                    error: 'User not found or inactive'
+                    error: 'User not found'
+                });
+            }
+            if (!user.isActive) {
+                return res.status(401).json({
+                    error: 'Your account has been paused. Please contact your administrator.',
+                    code: 'ACCOUNT_PAUSED'
                 });
             }
 
