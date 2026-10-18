@@ -66,6 +66,19 @@ async function upsertMax(day, runHours, ml) {
   );
 }
 
+// Run-hours counter tracking: the PLC counter resets to 0 (around 22:00 Nairobi).
+// When it drops, the value just before the drop is the finished day's run hours.
+let cycleMax = null;
+
+async function saveCompletedCycle(day, hours) {
+  await getPool().query(
+    `INSERT INTO daily_summary (day, run_hours, updated_at) VALUES ($1, $2, NOW())
+     ON CONFLICT (day) DO UPDATE SET run_hours = EXCLUDED.run_hours, updated_at = NOW()`,
+    [day, hours]
+  );
+  console.log(`[dailySummary] counter reset detected - saved ${hours}h for ${day}`);
+}
+
 async function sample() {
   try {
     const mins = plantMinutesSinceMidnight();
@@ -78,6 +91,16 @@ async function sample() {
     // The PLC counter resets around 22:00 Nairobi (not midnight), so only check 0..24
     if (run !== null && (run < 0 || run > 24)) run = null;
     if (ml !== null && ml < 0) ml = null;
+
+    // Reset detection: value fell back (e.g. 23 -> 0) => save the previous value
+    if (run !== null) {
+      if (cycleMax !== null && run < cycleMax) {
+        if (cycleMax >= 2) await saveCompletedCycle(dosingDayKey(), cycleMax);  // ignore 1->0 glitches
+        cycleMax = run;
+      } else if (cycleMax === null || run > cycleMax) {
+        cycleMax = run;
+      }
+    }
 
     const day = dosingDayKey();
 
