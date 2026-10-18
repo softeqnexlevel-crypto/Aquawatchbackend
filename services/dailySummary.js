@@ -69,6 +69,8 @@ async function upsertMax(day, runHours, ml) {
 // Run-hours counter tracking: the PLC counter resets to 0 (around 22:00 Nairobi).
 // When it drops, the value just before the drop is the finished day's run hours.
 let cycleMax = null;
+let pendingReset = null;
+const RESET_CONFIRM_MS = 15 * 60 * 1000;
 
 async function saveCompletedCycle(day, hours) {
   await getPool().query(
@@ -92,11 +94,21 @@ async function sample() {
     if (run !== null && (run < 0 || run > 24)) run = null;
     if (ml !== null && ml < 0) ml = null;
 
-    // Reset detection: value fell back (e.g. 23 -> 0) => save the previous value
+    // Reset detection. The PLC sometimes sends a brief 0 (a few minutes) and then returns to the
+    // real value - that is a glitch, not a new day. A drop only counts as a reset if the value is
+    // STILL lower than before after RESET_CONFIRM_MS. Then the previous value is saved.
     if (run !== null) {
-      if (cycleMax !== null && run < cycleMax) {
-        if (cycleMax >= 2) await saveCompletedCycle(dosingDayKey(), cycleMax);  // ignore 1->0 glitches
-        cycleMax = run;
+      const now = Date.now();
+      if (pendingReset) {
+        if (run >= pendingReset.max) {                       // came back: it was a glitch
+          cycleMax = run; pendingReset = null;
+        } else if (now - pendingReset.at >= RESET_CONFIRM_MS) {  // still low: real reset
+          await saveCompletedCycle(pendingReset.day, pendingReset.max);
+          cycleMax = run; pendingReset = null;
+        }
+      } else if (cycleMax !== null && run < cycleMax) {
+        if (cycleMax >= 2) pendingReset = { max: cycleMax, at: now, day: dosingDayKey() };
+        else cycleMax = run;
       } else if (cycleMax === null || run > cycleMax) {
         cycleMax = run;
       }
