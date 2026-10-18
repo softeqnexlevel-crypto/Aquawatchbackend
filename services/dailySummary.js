@@ -17,6 +17,7 @@ const RUN_TAG = 'RO5-SystemDailyRunHrs';
 const DOSE_TAG = 'RO5-AntiscalantDaily';
 const SAMPLE_EVERY_MS = 60 * 1000;
 const FRESH_MS = 5 * 60 * 1000;          // ignore readings older than 5 min (PLC offline)
+const RUN_FRESH_MS = 2 * 60 * 60 * 1000;
 const MIDNIGHT_GRACE_MIN = 10;           // skip sampling right after midnight (PLC reset may lag)
 const TZ = 'Africa/Nairobi';             // UTC+3, no DST
 const TZ_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -39,13 +40,13 @@ async function ensureTable() {
   `);
 }
 
-function readTag(latest, key) {
+function readTag(latest, key, freshMs = FRESH_MS) {
   const rec = latest && latest[key];
   if (!rec) return null;
   const v = Number(rec.value);
   if (!Number.isFinite(v)) return null;
   const ts = rec.timestamp ? new Date(rec.timestamp).getTime() : Date.now();
-  if (!Number.isFinite(ts) || Date.now() - ts > FRESH_MS) return null;
+  if (!Number.isFinite(ts) || Date.now() - ts > freshMs) return null;
   return v;
 }
 
@@ -71,11 +72,11 @@ async function sample() {
     if (mins < MIDNIGHT_GRACE_MIN) return;               // PLC counter may not have reset yet
 
     const latest = require('./plcParser').getLatestFull();   // lazy: avoids circular require
-    let run = readTag(latest, RUN_TAG);
+    let run = readTag(latest, RUN_TAG, RUN_FRESH_MS);   // slow hourly tag: accept up to 2h old
     let ml = readTag(latest, DOSE_TAG);
 
-    // Run hours today can never exceed the hours elapsed since midnight (+ small tolerance)
-    if (run !== null && (run < 0 || run > mins / 60 + 0.25)) run = null;
+    // The PLC counter resets around 22:00 Nairobi (not midnight), so only check 0..24
+    if (run !== null && (run < 0 || run > 24)) run = null;
     if (ml !== null && ml < 0) ml = null;
 
     const day = dosingDayKey();
@@ -177,6 +178,9 @@ async function start() {
   timer = setInterval(sample, SAMPLE_EVERY_MS);
   if (timer.unref) timer.unref();
   setTimeout(sample, 15 * 1000);
+  // re-run backfill hourly (last 3 days) so any missed readings are recovered from stored history
+  const bf = setInterval(() => backfill(3), 60 * 60 * 1000);
+  if (bf.unref) bf.unref();
   console.log('[dailySummary] started (saving daily run hours + antiscalant every 60s)');
 }
 
