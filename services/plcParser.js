@@ -6,11 +6,15 @@ const path = require('path');
 
 const { parameterFromTopic } = require('../mqtt/topicManager');
 
-const { broadcast } = require('./socketService');
+const { broadcast: socketBroadcast } = require('./socketService');
 
-const { evaluate } = require('./alarmService');
+const { evaluate: evaluateAlarm } = require('./alarmService');
 
 const { saveMeasurement } = require('../database/postgres');
+
+const tenantsService = require('./tenants.service');
+
+const DEFAULT_TENANT_ID = 1;
 
 const { recordDosingState } = require('./dosingService');
 
@@ -208,7 +212,31 @@ function dlog(...args) {
 
    ============================================================ */
 
-const latest = {};
+/* ---- one data context per tenant: its own latest values and DB-sampling state ---- */
+
+const contexts = new Map();
+
+function ctxFor(tenantId) {
+
+  const id = Number(tenantId) || DEFAULT_TENANT_ID;
+
+  let c = contexts.get(id);
+
+  if (!c) {
+
+    c = { tenantId: id, latest: {}, lastDbWriteTime: {}, lastDbWrittenValue: {}, dataCount: 0 };
+
+    contexts.set(id, c);
+
+  }
+
+  return c;
+
+}
+
+// Tenant 1 (the original plant): this is the data the alert engine, dosing totalizer,
+// daily summary and reports have always read.
+const latest = ctxFor(DEFAULT_TENANT_ID).latest;
 
 let dataCount = 0;
 
@@ -271,7 +299,7 @@ startAlertNotifier({
   });
 
 
-function notifyTag(record) {
+function notifyTagMain(record) {
   if (!record || record.simulated) {
     return;
   }
@@ -313,13 +341,13 @@ const lastDbWriteTime = {};
 
 const lastDbWrittenValue = {};
 
-function shouldWriteToDb(parameter, value, dataType) {
+function shouldWriteToDb(ctx, parameter, value, dataType) {
 
   const now = Date.now();
 
-  const last = lastDbWriteTime[parameter] || 0;
+  const last = ctx.lastDbWriteTime[parameter] || 0;
 
-  const valueChanged = lastDbWrittenValue[parameter] !== value;
+  const valueChanged = ctx.lastDbWrittenValue[parameter] !== value;
 
   // Bits are written whenever their state changes.
 
@@ -327,9 +355,9 @@ function shouldWriteToDb(parameter, value, dataType) {
 
     if (valueChanged) {
 
-      lastDbWriteTime[parameter] = now;
+      ctx.lastDbWriteTime[parameter] = now;
 
-      lastDbWrittenValue[parameter] = value;
+      ctx.lastDbWrittenValue[parameter] = value;
 
       return true;
 
@@ -341,9 +369,9 @@ function shouldWriteToDb(parameter, value, dataType) {
 
   if (now - last >= DB_SAMPLE_INTERVAL_MS) {
 
-    lastDbWriteTime[parameter] = now;
+    ctx.lastDbWriteTime[parameter] = now;
 
-    lastDbWrittenValue[parameter] = value;
+    ctx.lastDbWrittenValue[parameter] = value;
 
     return true;
 
@@ -1219,7 +1247,7 @@ function archiveRawPayload(topic, rawBuf) {
 
    ============================================================ */
 
-function recordToDB(record) {
+function recordToDB(ctx, record) {
 
   if (!record) {
 
@@ -1257,6 +1285,12 @@ function recordToDB(record) {
 
   };
 
+  if (ctx.tenantId !== DEFAULT_TENANT_ID) {
+
+    return tenantsService.saveMeasurement(ctx.tenantId, payload);
+
+  }
+
   return saveMeasurement(payload);
 
 }
@@ -1268,7 +1302,7 @@ function recordToDB(record) {
    ============================================================ */
 
 
-function notifyTag(record) {
+function notifyTagMain(record) {
   if (!record || record.simulated) {
     return;
   }
@@ -1296,7 +1330,22 @@ function notifyTag(record) {
     );
   }
 }
-   function processMeasurement(topic, measurement, idx, rawBuf) {
+function processMeasurement(topic, measurement, idx, rawBuf, ctx) {
+
+  ctx = ctx || ctxFor(DEFAULT_TENANT_ID);
+
+  // Everything below works on THIS tenant's data. Alerts, emails, the dosing totalizer and the
+  // alarm engine are still tenant-1 only; other tenants get storage + live data + dashboards.
+  const isMain = ctx.tenantId === DEFAULT_TENANT_ID;
+
+  const latest = ctx.latest;
+
+  const broadcast = (event, payload) => socketBroadcast(event, payload, ctx.tenantId);
+
+  const evaluate = (p, v) => (isMain ? evaluateAlarm(p, v) : []);
+
+  const notifyTag = (r) => { if (isMain) notifyTagMain(r); };
+
 
   let parameter =
 
@@ -1352,7 +1401,7 @@ function notifyTag(record) {
 
    */
 
-  if (parameter === 'AntiscalantDosingActive') {
+  if (isMain && parameter === 'AntiscalantDosingActive') {
 
     try {
 
@@ -1554,11 +1603,11 @@ function notifyTag(record) {
 
     /* SAVE SCALED VALUE */
 
-    if (shouldWriteToDb('RO5-FeedTankLevel', scaledValue, 'float')) {
+    if (shouldWriteToDb(ctx, 'RO5-FeedTankLevel', scaledValue, 'float')) {
 
-      recordToDB(scaledRecord).catch((err) => {
+      recordToDB(ctx, scaledRecord).catch((err) => {
 
-        if (dataCount % 100 === 0) {
+        if (ctx.dataCount % 100 === 0) {
 
           console.error(
 
@@ -1576,11 +1625,11 @@ function notifyTag(record) {
 
     /* SAVE RAW VALUE */
 
-    if (shouldWriteToDb('RO5-FeedTankLevelRaw', rawValue, 'float')) {
+    if (shouldWriteToDb(ctx, 'RO5-FeedTankLevelRaw', rawValue, 'float')) {
 
-      recordToDB(rawRecord).catch((err) => {
+      recordToDB(ctx, rawRecord).catch((err) => {
 
-        if (dataCount % 100 === 0) {
+        if (ctx.dataCount % 100 === 0) {
 
           console.error(
 
@@ -1696,13 +1745,13 @@ function notifyTag(record) {
 
   latest[parameter] = record;
 
-  dataCount++;
+  ctx.dataCount++;
 
-  if (dataCount % 50 === 0) {
+  if (ctx.dataCount % 50 === 0) {
 
     console.log(
 
-      `[plc] 📊 Processed ${dataCount} data points. ` +
+      `[plc] 📊 Processed ${ctx.dataCount} data points. ` +
 
       `Latest: ${parameter}=${record.value}` +
 
@@ -1774,11 +1823,11 @@ function notifyTag(record) {
 
      ---------------------------------------------------------- */
 
-  if (shouldWriteToDb(parameter, record.value, record.dataType)) {
+  if (shouldWriteToDb(ctx, parameter, record.value, record.dataType)) {
 
-    recordToDB(record).catch((err) => {
+    recordToDB(ctx, record).catch((err) => {
 
-      if (dataCount % 100 === 0) {
+      if (ctx.dataCount % 100 === 0) {
 
         console.error(
 
@@ -1854,7 +1903,10 @@ function notifyTag(record) {
 
    ============================================================ */
 
-function handleIncoming(topic, raw) {
+function handleIncoming(topic, raw, tenantId) {
+
+  const ctx = ctxFor(tenantId);
+
 
   const rawBuf = bufferFromRaw(raw);
 
@@ -1901,7 +1953,7 @@ function handleIncoming(topic, raw) {
   }
 
     // Any packet from the ABox proves the link is alive.
-  if (alertNotifier) alertNotifier.onTag();
+  if (ctx.tenantId === DEFAULT_TENANT_ID && alertNotifier) alertNotifier.onTag();
 
   /* RAW DEBUG LOG */
 
@@ -2125,7 +2177,7 @@ function handleIncoming(topic, raw) {
 
     try {
 
-      processMeasurement(topic, measurement, idx, rawBuf);
+      processMeasurement(topic, measurement, idx, rawBuf, ctx);
 
     } catch (err) {
 
@@ -2149,11 +2201,11 @@ function handleIncoming(topic, raw) {
 
    ============================================================ */
 
-function getLatestSnapshot() {
+function getLatestSnapshot(tenantId) {
 
   const out = {};
 
-  for (const [key, value] of Object.entries(latest)) {
+  for (const [key, value] of Object.entries(ctxFor(tenantId).latest)) {
 
     out[key] = value.value;
 
@@ -2163,9 +2215,9 @@ function getLatestSnapshot() {
 
 }
 
-function getLatestFull() {
+function getLatestFull(tenantId) {
 
-  return latest;
+  return ctxFor(tenantId).latest;
 
 }
 

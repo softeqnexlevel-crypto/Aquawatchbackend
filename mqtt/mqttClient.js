@@ -1,150 +1,151 @@
+// backend/mqtt/mqttClient.js — one MQTT connection per tenant.
+// Tenant 1 (the original plant) works exactly as before: broker/login from the environment
+// unless a broker is saved for it on the website. Other tenants use the broker saved for them
+// on the website (or the shared platform broker with their own topic root when none is set).
 const mqtt = require("mqtt");
 const { handleIncoming } = require("../services/plcParser");
+const tenants = require("../services/tenants.service");
 
-let client = null;
-let watchdogTimer = null;
-let lastMessageAt = 0;
-let lastForcedReconnectAt = 0;
-let stopping = false;
+const DEFAULT_TENANT_ID = tenants.DEFAULT_TENANT_ID;
 
 // ABox publishes about once a minute. If nothing arrives for this long,
 // assume the broker connection is stuck and rebuild it.
 const STALE_MS = Number(process.env.MQTT_STALE_MS) || 180000; // 3 minutes
 const CHECK_EVERY_MS = 30000;
 
-function getConfig() {
+const conns = new Map();   // tenantId -> { client, cfg, lastMessageAt, lastForcedAt }
+let watchdogTimer = null;
+let stopping = false;
+
+function envConfig() {
   return {
     url: process.env.MQTT_BROKER || process.env.MQTT_URL || "mqtt://broker.emqx.io:1883",
+    username: process.env.MQTT_USERNAME || undefined,
+    password: process.env.MQTT_PASSWORD || undefined,
     root: process.env.MQTT_TOPIC_ROOT || "RO5",
   };
 }
 
-function connectClient() {
-  const { url, root } = getConfig();
+/** Connection settings for one tenant row. */
+function configFor(row) {
+  const env = envConfig();
+  const own = !!row.mqtt_url;
+  const isDefault = Number(row.id) === DEFAULT_TENANT_ID;
+  return {
+    id: Number(row.id),
+    name: row.name,
+    url: row.mqtt_url || env.url,
+    username: own ? (row.mqtt_username || undefined) : env.username,
+    password: own ? (tenants.decrypt(row.mqtt_password_enc) || undefined) : env.password,
+    root: row.topic_root || (isDefault ? env.root : `tenants/${row.slug}`),
+    shared: !own,
+  };
+}
 
-  console.log(`[mqtt] connecting to ${url}, topic root "${root}"...`);
-
+function connectTenant(cfg) {
+  const c = { client: null, cfg, lastMessageAt: Date.now(), lastForcedAt: 0 };
+  conns.set(cfg.id, c);
+  console.log(`[mqtt][${cfg.name}] connecting to ${cfg.url}, topic root "${cfg.root}"...`);
   try {
-    client = mqtt.connect(url, {
-      clientId: `RO5-${Date.now()}`,
-      username: process.env.MQTT_USERNAME || undefined,
-      password: process.env.MQTT_PASSWORD || undefined,
+    const client = mqtt.connect(cfg.url, {
+      clientId: `RO5-t${cfg.id}-${Date.now()}`,
+      username: cfg.username,
+      password: cfg.password,
       clean: true,
       connectTimeout: 10000,
       keepalive: 30,
       reconnectPeriod: 2000,
     });
+    c.client = client;
 
     client.on("connect", () => {
-      console.log(`[mqtt] ✅ connected to ${url}`);
-      // Give the watchdog a fresh start after every (re)connect
-      lastMessageAt = Date.now();
-
-      const wildcard = `${root}/#`;
+      console.log(`[mqtt][${cfg.name}] ✅ connected to ${cfg.url}`);
+      c.lastMessageAt = Date.now();
+      const wildcard = `${cfg.root}/#`;
       client.subscribe(wildcard, { qos: 1 }, (err) => {
-        if (err) console.error("[mqtt] subscribe error:", err.message);
-        else console.log(`[mqtt] 📡 subscribed to ${wildcard}`);
+        if (err) console.error(`[mqtt][${cfg.name}] subscribe error:`, err.message);
+        else console.log(`[mqtt][${cfg.name}] 📡 subscribed to ${wildcard}`);
       });
     });
-
-    client.on("reconnect", () => console.log("[mqtt] reconnecting..."));
-    client.on("offline", () => console.warn("[mqtt] offline — broker unreachable, will keep retrying automatically"));
-    client.on("close", () => console.log("[mqtt] connection closed"));
-    client.on("error", (err) => console.error("[mqtt] error:", err));
-
+    client.on("reconnect", () => console.log(`[mqtt][${cfg.name}] reconnecting...`));
+    client.on("offline", () => console.warn(`[mqtt][${cfg.name}] offline — broker unreachable, will keep retrying automatically`));
+    client.on("close", () => console.log(`[mqtt][${cfg.name}] connection closed`));
+    client.on("error", (err) => console.error(`[mqtt][${cfg.name}] error:`, err && err.message ? err.message : err));
     client.on("message", (topic, payload) => {
-      lastMessageAt = Date.now();
-      console.log(`[mqtt] message on ${topic} (${payload.length} bytes)`);
-
-      try {
-        handleIncoming(topic, payload.toString());
-      } catch (err) {
-        console.error("[mqtt] handler error:", err.message);
-      }
+      c.lastMessageAt = Date.now();
+      console.log(`[mqtt][${cfg.name}] message on ${topic} (${payload.length} bytes)`);
+      try { handleIncoming(topic, payload.toString(), cfg.id); }
+      catch (err) { console.error(`[mqtt][${cfg.name}] handler error:`, err.message); }
     });
   } catch (error) {
-    console.error("[mqtt] Failed to create MQTT client:", error.message);
+    console.error(`[mqtt][${cfg.name}] Failed to create MQTT client:`, error.message);
   }
 }
 
-// Tear down the current client and build a brand new connection
-function forceReconnect(reason) {
-  const now = Date.now();
-  // Don't hammer the broker: at most one forced rebuild per STALE_MS
-  if (now - lastForcedReconnectAt < STALE_MS) return;
-  lastForcedReconnectAt = now;
-
-  console.warn(`[mqtt] ⚠️ watchdog: ${reason} — rebuilding broker connection`);
-
-  const old = client;
-  client = null;
-
-  const rebuild = () => {
-    if (!stopping) connectClient();
-  };
-
-  if (old) {
-    try {
-      old.removeAllListeners();
-      old.on("error", () => {}); // swallow late errors from the dead client
-      old.end(true, {}, rebuild); // force close, then rebuild
-      // Safety net in case the end callback never fires
-      setTimeout(() => {
-        if (!client) rebuild();
-      }, 3000);
-    } catch (err) {
-      console.error("[mqtt] error closing old client:", err.message);
-      rebuild();
-    }
-  } else {
-    rebuild();
+function endTenant(id) {
+  const c = conns.get(id);
+  if (!c) return;
+  conns.delete(id);
+  if (c.client) {
+    try { c.client.removeAllListeners(); c.client.on("error", () => {}); c.client.end(true); }
+    catch (err) { console.error("[mqtt] error closing client:", err.message); }
   }
 }
 
 function startWatchdog() {
   if (watchdogTimer) clearInterval(watchdogTimer);
-
-  watchdogTimer = setInterval(() => {
-    if (!lastMessageAt) return;
-    const silentFor = Date.now() - lastMessageAt;
-
-    if (silentFor > STALE_MS) {
-      forceReconnect(`no MQTT message for ${Math.round(silentFor / 1000)}s`);
+  watchdogTimer = setInterval(async () => {
+    for (const [id, c] of conns) {
+      const silentFor = Date.now() - c.lastMessageAt;
+      if (silentFor > STALE_MS && Date.now() - c.lastForcedAt >= STALE_MS) {
+        console.warn(`[mqtt][${c.cfg.name}] ⚠️ watchdog: no MQTT message for ${Math.round(silentFor / 1000)}s — rebuilding broker connection`);
+        try { await reloadTenant(id, true); const n = conns.get(id); if (n) n.lastForcedAt = Date.now(); }
+        catch (e) { console.error("[mqtt] watchdog reload failed:", e.message); }
+      }
     }
   }, CHECK_EVERY_MS);
-
-  // Don't keep the process alive just for this timer
   if (watchdogTimer.unref) watchdogTimer.unref();
 }
 
-function initMqtt() {
+/** Start a connection for every tenant. A tenant that fails does not stop the others. */
+async function initMqtt() {
   stopping = false;
-  lastMessageAt = Date.now();
-  connectClient();
+  let rows = [];
+  try { rows = await tenants.listAll(); }
+  catch (e) {
+    // database not ready: still connect the original plant from the environment
+    console.error("[mqtt] could not load tenants, starting tenant 1 from the environment:", e.message);
+    rows = [{ id: DEFAULT_TENANT_ID, name: "Aqua System Tech", slug: "aqua-system-tech" }];
+  }
+  if (!rows.some((r) => Number(r.id) === DEFAULT_TENANT_ID)) rows.unshift({ id: DEFAULT_TENANT_ID, name: "Aqua System Tech", slug: "aqua-system-tech" });
+  for (const row of rows) {
+    try { connectTenant(configFor(row)); } catch (e) { console.error(`[mqtt] tenant ${row.id} failed:`, e.message); }
+  }
   startWatchdog();
+}
+
+/** Re-read one tenant's saved settings and reconnect it (used by "Save & Connect"). */
+async function reloadTenant(id) {
+  id = Number(id);
+  endTenant(id);
+  if (stopping) return;
+  const row = await tenants.getRow(id);
+  if (!row) return;
+  connectTenant(configFor(row));
 }
 
 function closeMqtt() {
   stopping = true;
-  if (watchdogTimer) {
-    clearInterval(watchdogTimer);
-    watchdogTimer = null;
-  }
-  if (client) {
-    try {
-      client.end(true);
-    } catch (err) {
-      console.error("[mqtt] error closing client:", err.message);
-    }
-    client = null;
-  }
+  if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
+  for (const id of [...conns.keys()]) endTenant(id);
   console.log("[mqtt] closed for shutdown");
 }
 
+// Used by the API's "publish" (staff only): feeds a value into the original plant's pipeline.
 function publish(topic, value) {
   try {
     const payload = typeof value === "object" ? JSON.stringify(value) : String(value);
-    handleIncoming(topic, payload);
+    handleIncoming(topic, payload, DEFAULT_TENANT_ID);
     console.log(`[mqtt] 📤 Published to ${topic}`);
   } catch (err) {
     console.error("[mqtt] Publish error:", err.message);
@@ -152,25 +153,36 @@ function publish(topic, value) {
   }
 }
 
-function getStatus() {
+function getStatus(tenantId = DEFAULT_TENANT_ID) {
+  tenantId = Number(tenantId) || DEFAULT_TENANT_ID;
+  const c = conns.get(tenantId);
+  const env = envConfig();
+  const cfg = c ? c.cfg : null;
+  let host = "";
+  try { host = new URL(cfg ? cfg.url : env.url).host; } catch (_) { /* hide anything unparsable */ }
   return {
-    connected: !!(client && client.connected),
+    tenantId,
+    connected: !!(c && c.client && c.client.connected),
     simulationMode: false,
-    broker: process.env.MQTT_BROKER || process.env.MQTT_URL || "mqtt://localhost:1883",
-    topicRoot: process.env.MQTT_TOPIC_ROOT || "RO5",
-    dataPoints: getDataPointCount(),
-    lastMessageAt: lastMessageAt || null,
-    secondsSinceLastMessage: lastMessageAt ? Math.round((Date.now() - lastMessageAt) / 1000) : null,
+    broker: cfg ? cfg.url.replace(/\/\/[^@/]*@/, "//") : env.url,   // never show embedded credentials
+    brokerHost: host,
+    shared: cfg ? cfg.shared : true,
+    topicRoot: cfg ? cfg.root : env.root,
+    dataPoints: getDataPointCount(tenantId),
+    lastMessageAt: c && c.lastMessageAt ? c.lastMessageAt : null,
+    secondsSinceLastMessage: c && c.lastMessageAt ? Math.round((Date.now() - c.lastMessageAt) / 1000) : null,
   };
 }
 
-function getDataPointCount() {
+function getDataPointCount(tenantId) {
   try {
     const { getLatestFull } = require("../services/plcParser");
-    return Object.keys(getLatestFull()).length;
+    return Object.keys(getLatestFull(tenantId)).length;
   } catch (err) {
     return 0;
   }
 }
 
-module.exports = { initMqtt, publish, getStatus, closeMqtt };
+function activeTenantIds() { return [...conns.keys()]; }
+
+module.exports = { initMqtt, publish, getStatus, closeMqtt, reloadTenant, activeTenantIds };

@@ -1,6 +1,10 @@
 // backend/services/socketService.js
 let ioRef = null;
 
+const DEFAULT_TENANT_ID = 1;
+
+const room = (tenantId) => `tenant:${Number(tenantId) || DEFAULT_TENANT_ID}`;
+
 // SOCKET_REQUIRE_AUTH=true  -> connections without a valid login token are rejected.
 // Leave it unset until the website sends the token (see DataContext), otherwise
 // the live data would stop for everyone.
@@ -34,6 +38,14 @@ function initSocket(io) {
       if (!user) return REQUIRE_AUTH ? next(new Error('AUTH_INVALID')) : next();
       if (!user.isActive) return next(new Error('ACCOUNT_PAUSED'));
       socket.data.userId = user.id;
+      // Which plant is this browser looking at? Only a tenant the user may open is accepted.
+      const wanted = Number(socket.handshake.auth && socket.handshake.auth.tenantId) || DEFAULT_TENANT_ID;
+      try {
+        const tenants = require('./tenants.service');
+        socket.data.tenantId = (await tenants.canAccess(user, wanted)) ? wanted : DEFAULT_TENANT_ID;
+      } catch (e) {
+        socket.data.tenantId = DEFAULT_TENANT_ID;
+      }
       return next();
     } catch (err) {
       console.error('[socket] auth error:', err.message);
@@ -51,10 +63,13 @@ function initSocket(io) {
     console.log(`[socket] 📡 Client origin:`, socket.handshake.headers.origin);
     console.log(`[socket] 📡 Client address:`, socket.handshake.address);
 
+    const tenantId = (socket.data && socket.data.tenantId) || DEFAULT_TENANT_ID;
+    socket.join(room(tenantId));
+
     // Send MQTT status
     try {
       const { getStatus } = require("../mqtt/mqttClient");
-      const status = getStatus();
+      const status = getStatus(tenantId);
       socket.emit("mqtt-status", status);
       console.log('[socket] 📡 Sent MQTT status to client');
     } catch (err) {
@@ -64,7 +79,7 @@ function initSocket(io) {
     // Send latest data
     try {
       const { getLatestFull } = require("./plcParser");
-      const latest = getLatestFull();
+      const latest = getLatestFull(tenantId);
       const keys = Object.keys(latest);
       console.log(`[socket] 📊 Sending ${keys.length} readings to client`);
 
@@ -79,7 +94,7 @@ function initSocket(io) {
     socket.on("get-latest-data", () => {
       try {
         const { getLatestFull } = require("./plcParser");
-        const latest = getLatestFull();
+        const latest = getLatestFull(tenantId);
         console.log(`[socket] 📊 Sending ${Object.keys(latest).length} readings on request`);
         Object.values(latest).forEach(record => {
           socket.emit("plc-data", record);
@@ -96,14 +111,14 @@ function initSocket(io) {
   });
 }
 
-function broadcast(event, payload) {
+function broadcast(event, payload, tenantId = DEFAULT_TENANT_ID) {
   if (!ioRef) {
     console.warn('[socket] ⚠️ Cannot broadcast - ioRef is null');
     return false;
   }
 
   try {
-    ioRef.emit(event, payload);
+    ioRef.to(room(tenantId)).emit(event, payload);
     return true;
   } catch (err) {
     console.error('[socket] Broadcast error:', err.message);
@@ -111,11 +126,11 @@ function broadcast(event, payload) {
   }
 }
 
-function broadcastMqttStatus() {
+function broadcastMqttStatus(tenantId = DEFAULT_TENANT_ID) {
   if (!ioRef) return;
   try {
     const { getStatus } = require("../mqtt/mqttClient");
-    ioRef.emit("mqtt-status", getStatus());
+    ioRef.to(room(tenantId)).emit("mqtt-status", getStatus(tenantId));
   } catch (err) {
     console.error('[socket] Status error:', err.message);
   }

@@ -46,6 +46,18 @@ async function initUsers() {
    HELPERS
    ============================================================ */
 
+// Super admins = admins who may manage other admins. Stored as preferences.superAdmin,
+// and these emails are always super admins (override with SUPER_ADMIN_EMAILS="a@x.com,b@y.com").
+const SUPER_ADMIN_EMAILS = (process.env.SUPER_ADMIN_EMAILS ||
+    'softeqnexlevel@gmail.com,aquasystemtech.co.ke@gmail.com')
+    .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
+
+function isSuperAdminUser(user) {
+    if (!user || user.role !== 'admin') return false;
+    return (user.preferences && user.preferences.superAdmin === true) ||
+        SUPER_ADMIN_EMAILS.includes(String(user.email || '').toLowerCase());
+}
+
 function toPublicUser(user) {
     if (!user) return null;
     return {
@@ -54,9 +66,11 @@ function toPublicUser(user) {
         firstName: user.firstName,
         lastName: user.lastName,
         role: user.role,
+        isSuperAdmin: isSuperAdminUser(user),
         permissions: Array.isArray(user.permissions) ? user.permissions : [],
         isActive: user.isActive,
         phone: user.phone,
+        emailAlerts: !(user.preferences && user.preferences.emailAlerts === false),
         createdAt: user.createdAt,
     };
 }
@@ -169,6 +183,7 @@ class AuthService {
             role: userData.role || 'operator',
             phone: userData.phone || '',
             permissions: Array.isArray(userData.permissions) ? userData.permissions : [],
+            ...(userData.superAdmin === true && userData.role === 'admin' ? { preferences: { superAdmin: true } } : {}),
         });
 
         return toPublicUser(user);
@@ -203,7 +218,38 @@ class AuthService {
             patch.isActive = updates.isActive;
         }
 
+        if (typeof updates.emailAlerts === 'boolean') {
+            patch.preferences = { ...(patch.preferences || current.preferences || {}), emailAlerts: updates.emailAlerts };
+        }
+
+        // ---- super admin rules ----
+        const actorIsSuper = meta.actorIsSuper === true;
+        const isSelf = meta.actorId && meta.actorId === id;
+        if (current.role === 'admin' && !actorIsSuper && !isSelf) {
+            throw new Error('Only a super admin can change admin accounts');
+        }
+        if (patch.role === 'admin' && current.role !== 'admin' && !actorIsSuper) {
+            throw new Error('Only a super admin can make someone an admin');
+        }
+        if (typeof updates.superAdmin === 'boolean') {
+            if (!actorIsSuper) throw new Error('Only a super admin can change super admin status');
+            if (updates.superAdmin === false && SUPER_ADMIN_EMAILS.includes(String(current.email).toLowerCase())) {
+                throw new Error('This account is a permanent super admin (set in SUPER_ADMIN_EMAILS)');
+            }
+            if (isSelf && updates.superAdmin === false) throw new Error('You cannot remove your own super admin status');
+            patch.preferences = { ...(patch.preferences || current.preferences || {}), superAdmin: updates.superAdmin };
+        }
+        // moving someone off the admin role also clears the super admin flag
+        if (patch.role && patch.role !== 'admin' && current.preferences && current.preferences.superAdmin) {
+            patch.preferences = { ...(patch.preferences || current.preferences), superAdmin: false };
+        }
+        if (typeof updates.password === 'string' && updates.password.length > 0) {
+            if (updates.password.length < 8) throw new Error('Password must be at least 8 characters');
+            patch.passwordHash = await bcrypt.hash(updates.password, 10);
+        }
+
         if (typeof updates.email !== 'undefined') {
+            updates.email = String(updates.email).trim().toLowerCase();
             const existing = await db.findUserByEmail(updates.email);
             if (existing && existing.id !== id) {
                 throw new Error('Email already in use by another account');
@@ -228,6 +274,9 @@ class AuthService {
         if (!user) throw new Error('User not found');
 
         // Pausing: end every existing session right away
+        if (patch.passwordHash) {
+            await db.revokeAllUserRefreshTokens(id);
+        }
         if (pausing) {
             await db.revokeAllUserRefreshTokens(id);
             this._cutLiveConnections(id);
@@ -254,6 +303,9 @@ class AuthService {
         const current = await db.findUserById(id);
         if (!current || current.deletedAt) throw new Error('User not found');
         if (meta.actorId && meta.actorId === id) throw new Error('You cannot delete your own account');
+        if (current.role === 'admin' && meta.actorIsSuper !== true) {
+            throw new Error('Only a super admin can delete admin accounts');
+        }
         if (current.role === 'admin' && current.isActive === true &&
             (await this._otherActiveAdmins(id)).length === 0) {
             throw new Error('At least one active admin must remain');

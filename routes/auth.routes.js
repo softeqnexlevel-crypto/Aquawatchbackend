@@ -2,6 +2,8 @@
 const express = require('express');
 const router = express.Router();
 const authService = require('../services/auth.service');
+const tenantContext = require('../middleware/tenantContext');
+const tenants = require('../services/tenants.service');
 const authMiddleware = require('../middleware/auth.middleware');
 const rolesMiddleware = require('../middleware/roles.middleware');
 
@@ -83,6 +85,7 @@ router.post('/change-password', authMiddleware.requireAuth, async (req, res) => 
 // Register new user (admin only)
 router.post('/register', 
     authMiddleware.requireAuth, 
+    tenantContext,
     rolesMiddleware.requirePermission('user-management'),
     async (req, res) => {
         try {
@@ -98,11 +101,18 @@ router.post('/register',
                 return res.status(400).json({ error: `Role must be one of: ${VALID_ROLES.join(', ')}` });
             }
 
+            if (role === 'admin' && !req.user.isSuperAdmin) {
+                return res.status(403).json({ error: 'Only a super admin can create admin accounts' });
+            }
+
             const user = await authService.register({
                 email, password, firstName, lastName, phone,
+                superAdmin: req.body.superAdmin === true && !!req.user.isSuperAdmin,
                 role: role || 'operator',
                 permissions: Array.isArray(permissions) ? permissions : [],
             });
+
+            try { await tenants.setUserTenants(user.id, [req.tenantId]); } catch (e) { console.error('[auth] assign tenant', e.message); }
 
             await authService.logAction(
                 req.user.id, 'user_created', 'user', user.id,
@@ -120,10 +130,16 @@ router.post('/register',
 // Get all users (admin only)
 router.get('/users', 
     authMiddleware.requireAuth, 
+    tenantContext,
     rolesMiddleware.requirePermission('user-management'),
     async (req, res) => {
         try {
-            const users = await authService.getAllUsers();
+            let users = await authService.getAllUsers();
+            // Only the logins of the client being viewed (tenant 1 also owns users nobody assigned elsewhere).
+            const m = await tenants.userIdsOfTenant(req.tenantId);
+            const mine = new Set(m.only);
+            const elsewhere = new Set(m.assignedAnywhere || []);
+            users = users.filter((u) => mine.has(u.id) || (m.unassignedAlso && !elsewhere.has(u.id)));
             res.json({ users });
         } catch (error) {
             res.status(500).json({ error: 'Failed to get users' });
@@ -138,7 +154,7 @@ router.put('/users/:userId',
     async (req, res) => {
         try {
             const { userId } = req.params;
-            const { firstName, lastName, role, isActive, phone, permissions } = req.body;
+            const { firstName, lastName, role, isActive, phone, permissions, email, password, emailAlerts, superAdmin } = req.body;
 
             if (role && !VALID_ROLES.includes(role)) {
                 return res.status(400).json({ error: `Role must be one of: ${VALID_ROLES.join(', ')}` });
@@ -150,9 +166,9 @@ router.put('/users/:userId',
                 return res.status(400).json({ error: 'Cannot deactivate your own account' });
             }
 
-            const meta = { actorId: req.user.id, ip: req.ip, userAgent: req.headers['user-agent'] };
+            const meta = { actorId: req.user.id, actorIsSuper: !!req.user.isSuperAdmin, ip: req.ip, userAgent: req.headers['user-agent'] };
             const user = await authService.updateUser(userId, {
-                firstName, lastName, role, isActive, phone,
+                firstName, lastName, role, isActive, phone, email, password, emailAlerts, superAdmin,
                 ...(Array.isArray(permissions) ? { permissions } : {}),
             }, meta);
 
@@ -183,7 +199,7 @@ router.delete('/users/:userId',
             if (userId === req.user.id) {
                 return res.status(400).json({ error: 'Cannot delete yourself' });
             }
-            await authService.deleteUser(userId, { actorId: req.user.id });
+            await authService.deleteUser(userId, { actorId: req.user.id, actorIsSuper: !!req.user.isSuperAdmin });
             await authService.logAction(
                 req.user.id, 'user_deleted', 'user', userId, {},
                 req.ip, req.headers['user-agent']

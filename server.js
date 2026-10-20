@@ -47,6 +47,7 @@ const corsOptions = {
     "Authorization",
     "Accept",
     "X-Requested-With",
+      "X-Tenant-ID",  
   ],
   exposedHeaders: ["Content-Length", "X-Request-Id"],
   optionsSuccessStatus: 200,
@@ -117,6 +118,7 @@ const io = new Server(server, {
 
     // Seed/default users only after the database is ready.
     await authService.initUsers();
+    await require("./services/tenants.service").ensureTables();
   } catch (err) {
     app.locals.dbReady = false;
     console.error("========================================");
@@ -151,7 +153,7 @@ const io = new Server(server, {
   // pipeline) so it always has access to the live PLC tag store.
   // Do NOT start a second notifier here — that would double-send emails.
   try {
-    initMqtt();
+    await initMqtt(); // one connection per client (tenant), settings read from the database
   } catch (err) {
     console.error("[mqtt] init FAILED:", err);
   }
@@ -161,7 +163,7 @@ const io = new Server(server, {
   // --------------------------------------------------
   setInterval(() => {
     try {
-      broadcastMqttStatus();
+      for (const id of require("./mqtt/mqttClient").activeTenantIds()) broadcastMqttStatus(id);
     } catch (err) {
       console.error("[mqtt-status] broadcast error:", err.message);
     }
