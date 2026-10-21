@@ -23,7 +23,7 @@ const FRESH_MS = 5 * 60 * 1000;          // ignore readings older than 5 min (PL
 const RUN_FRESH_MS = 2 * 60 * 60 * 1000;
 const MIDNIGHT_GRACE_MIN = 10;           // skip sampling right after midnight (PLC reset may lag)
 const TZ = 'Africa/Nairobi';             // UTC+3, no DST
-const TZ_OFFSET_MS = 3 * 60 * 60 * 1000;
+const TZ_OFFSET_MS = 0;                  // the PLC's day starts at 00:00 UTC (= 03:00 Nairobi), see dosingDayKey()
 
 let timer = null;
 
@@ -81,6 +81,18 @@ async function upsertMax(day, runHours, ml) {
 const RESET_CONFIRM_MS = 15 * 60 * 1000;   // a drop must stand this long to count as a reset
 const LOW_REPEAT_MS = 5 * 60 * 1000;       // ...or be seen again at least this much later
 const HALF_DAY_MS = 12 * 60 * 60 * 1000;
+
+// The PLC resets its daily counter at ITS midnight. The stored readings show that is 00:00 UTC
+// (= 03:00 Nairobi): resets logged at 23:59:0x-23:59:5x UTC every night since 18 Oct. A drop to 0 close to that
+// moment is the real reset, so it is believed after 1 minute instead of 15. Drops at any other time are
+// still treated with suspicion (the gateway sometimes publishes a stray 0 and then the real value again).
+const PLC_MIDNIGHT_WINDOW_MS = 10 * 60 * 1000;
+function nearPlcMidnight(t) {
+  const sinceUtcMidnight = ((t % 86400000) + 86400000) % 86400000;
+  return sinceUtcMidnight <= PLC_MIDNIGHT_WINDOW_MS || sinceUtcMidnight >= 86400000 - PLC_MIDNIGHT_WINDOW_MS;
+}
+const confirmMs = (t) => (nearPlcMidnight(t) ? 60 * 1000 : RESET_CONFIRM_MS);
+const lowRepeatMs = (t) => (nearPlcMidnight(t) ? 30 * 1000 : LOW_REPEAT_MS);
 const HOUR_MS = 60 * 60 * 1000;
 
 const labelForReset = (t) => dosingDayKey(new Date(t - HALF_DAY_MS));
@@ -95,7 +107,7 @@ function analyzeRunCycles(readings, nowMs = Date.now()) {
     if (max === null) { max = v; startAt = t - v * HOUR_MS; continue; }
     if (pending) {
       if (v >= pending.max) { max = v; pending = null; continue; }            // came back up: it was a glitch
-      if (t - pending.at >= LOW_REPEAT_MS) {                                  // still low later: real reset
+      if (t - pending.at >= lowRepeatMs(pending.at)) {                                  // still low later: real reset
         cycles.push({ max: pending.max, startAt, resetAt: pending.at });
         startAt = pending.at; max = Math.max(pending.low, v); pending = null;
       }
@@ -108,7 +120,7 @@ function analyzeRunCycles(readings, nowMs = Date.now()) {
       max = v;
     }
   }
-  if (pending && nowMs - pending.at >= RESET_CONFIRM_MS) {                    // drop with nothing after it
+  if (pending && nowMs - pending.at >= confirmMs(pending.at)) {                    // drop with nothing after it
     cycles.push({ max: pending.max, startAt, resetAt: pending.at });
     startAt = pending.at; max = pending.low; pending = null;
   }
@@ -157,7 +169,7 @@ async function trackRunHours(run) {
   if (cycleMax === null) { cycleMax = run; cycleStartAt = now - run * HOUR_MS; }
   else if (pendingReset) {
     if (run >= pendingReset.max) { cycleMax = run; pendingReset = null; }      // glitch: value came back
-    else if (now - pendingReset.at >= RESET_CONFIRM_MS) {                       // still low: real reset
+    else if (now - pendingReset.at >= confirmMs(pendingReset.at)) {                       // still low: real reset
       const day = labelForReset(pendingReset.at);
       await saveRunLabel(day, pendingReset.max);
       console.log(`[dailySummary] counter reset detected - saved ${pendingReset.max}h for ${day}`);
@@ -256,7 +268,7 @@ async function getDay(day) {
   return rowOut(r.rows[0]);
 }
 
-// Hours the plant really ran on one Nairobi calendar day, from the stored feed flow
+// Hours the plant really ran on one PLC day (00:00-24:00 UTC), from the stored feed flow
 // (running = feed flow above 1 m3/h; gaps over 15 min are skipped, not guessed).
 async function runtimeFromFlow(day) {
   const [y, m, d] = day.split('-').map(Number);

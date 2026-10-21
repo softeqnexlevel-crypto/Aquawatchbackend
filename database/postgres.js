@@ -665,7 +665,10 @@ async function saveSettings(data, userId) {
     return result[0];
 }
 
-const PLANT_TZ_OFFSET_MS = 3 * 60 * 60 * 1000;
+// The PLC starts its day (and resets its daily counters) at 00:00 UTC = 03:00 Nairobi, as the stored
+// run-hours resets show. The dosing/run-hours "day" therefore follows the UTC date, so the website
+// starts a new day at the same moment the PLC does. (Production volumes still use Nairobi wall clock.)
+const PLANT_TZ_OFFSET_MS = 0;
 
 function dosingDayKey(date = new Date()) {
   const wall = new Date(date.getTime() + PLANT_TZ_OFFSET_MS);
