@@ -29,6 +29,8 @@ const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
   "http://localhost:3001",
+  "http://localhost:8081",   // Expo web preview
+  "http://localhost:19006",  // Expo web (older port)
 ];
 
 const corsOptions = {
@@ -47,7 +49,6 @@ const corsOptions = {
     "Authorization",
     "Accept",
     "X-Requested-With",
-      "X-Tenant-ID",  
   ],
   exposedHeaders: ["Content-Length", "X-Request-Id"],
   optionsSuccessStatus: 200,
