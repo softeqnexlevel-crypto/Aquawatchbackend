@@ -1355,6 +1355,15 @@ function processMeasurement(topic, measurement, idx, rawBuf, ctx) {
 
     null;
 
+  // This client's own tag names -> the standard names every page, chart and app uses (set on the Dashboard: Edit tags).
+  if (parameter) {
+
+    const renamed = tenantsService.tagMapFor(ctx.tenantId)[parameter];
+
+    if (renamed) parameter = renamed;
+
+  }
+
   /* ----------------------------------------------------------
 
      ANTISCALANT DOSING

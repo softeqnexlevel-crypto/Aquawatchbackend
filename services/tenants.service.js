@@ -87,6 +87,7 @@ function mergeConfig(c) {
   const cfg = { ...DEFAULT_CONFIG, ...(c || {}) };
   if (!Array.isArray(cfg.pages)) cfg.pages = DEFAULT_PAGES;
   if (!Array.isArray(cfg.systems)) cfg.systems = DEFAULT_CONFIG.systems;
+  if (!cfg.tagMap || typeof cfg.tagMap !== 'object' || Array.isArray(cfg.tagMap)) cfg.tagMap = {};
   return cfg;
 }
 // Safe for the browser: never includes the MQTT password.
@@ -154,6 +155,19 @@ function cleanConfig(c = {}, prev = {}) {
   if (c.feedTankCapacity !== undefined && c.feedTankCapacity !== '') out.feedTankCapacity = num(c.feedTankCapacity, 0.001, 1e6, 'Feed tank capacity');
   if (c.flushTankCapacity !== undefined && c.flushTankCapacity !== '') out.flushTankCapacity = num(c.flushTankCapacity, 0.001, 1e6, 'Flush tank capacity');
   if (Array.isArray(c.pages)) out.pages = c.pages.map(String).filter((p) => DEFAULT_PAGES.includes(p) || ['tag manager', 'billing', 'settings', 'user-management'].includes(p));
+  if (c.tagMap !== undefined) {
+    // { standard tag name: this client's own tag name }. Empty value = not renamed.
+    if (!c.tagMap || typeof c.tagMap !== 'object' || Array.isArray(c.tagMap)) throw new Error('Tag names must be an object');
+    const map = {}; const used = new Map();
+    for (const [std, mine] of Object.entries(c.tagMap)) {
+      const k = String(std).trim(); const v = String(mine == null ? '' : mine).trim();
+      if (!k || !v) continue;
+      if (!/^[A-Za-z0-9_.%\- ]{1,100}$/.test(k) || v.length > 100) throw new Error(`Invalid tag name: ${k}`);
+      if (used.has(v)) throw new Error(`"${v}" is used for both ${used.get(v)} and ${k}. One client tag can only mean one thing.`);
+      used.set(v, k); map[k] = v;
+    }
+    out.tagMap = map;
+  }
   if (Array.isArray(c.systems)) {
     out.systems = c.systems.slice(0, 20).map((s) => ({
       type: String(s.type || '').slice(0, 60), name: String(s.name || s.type || '').slice(0, 80),
@@ -199,8 +213,31 @@ async function update(id, patch) {
   if (patch.config) add('config', JSON.stringify(cleanConfig(patch.config, mergeConfig(cur.config))), '::jsonb');
   if (!sets.length) return cur;
   vals.push(id);
-  return (await pool().query(`UPDATE tenants SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING *`, vals)).rows[0];
+  const row = (await pool().query(`UPDATE tenants SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING *`, vals)).rows[0];
+  if (patch.config) await refreshTagMaps();
+  return row;
 }
+
+/* ---------- per-client tag names ----------
+   Each client may call its tags something else (e.g. "Feed_Pr" instead of "RO5-ROPressure"). The editor on the
+   Dashboard saves { standard name: client name } in the client's config; incoming readings are renamed to the
+   standard name here, so storage, live data, charts and the apps all see one set of names. */
+const tagMapCache = new Map();   // tenantId -> { clientName: standardName }
+async function refreshTagMaps() {
+  try {
+    await ensureTables();
+    const rows = (await pool().query('SELECT id, config FROM tenants')).rows;
+    tagMapCache.clear();
+    for (const r of rows) {
+      const m = (r.config && r.config.tagMap) || {};
+      const inv = {};
+      for (const [std, mine] of Object.entries(m)) if (mine) inv[String(mine)] = std;
+      if (Object.keys(inv).length) tagMapCache.set(Number(r.id), inv);
+    }
+  } catch (e) { console.error('[tenants] tag map refresh', e.message); }
+}
+/** sync: { clientName: standardName } for one client ({} when none) */
+function tagMapFor(id) { return tagMapCache.get(Number(id)) || {}; }
 
 /** Delete a client and its stored readings. The original plant (1) can never be deleted. */
 async function remove(id) {
@@ -228,7 +265,11 @@ async function saveMeasurement(tenantId, m) {
     [tenantId, m.timestamp ? new Date(m.timestamp) : new Date(), m.parameter, v, m.unit || null]);
 }
 
+// first load a little after start (the database is ready by then), then every 5 minutes
+setTimeout(refreshTagMaps, 20 * 1000).unref();
+setInterval(refreshTagMaps, 5 * 60 * 1000).unref();
+
 module.exports = {
   DEFAULT_TENANT_ID, DEFAULT_PAGES, ensureTables, listAll, getRow, publicTenant, mergeConfig,
-  tenantIdsForUser, defaultTenantFor, canAccess, setUserTenants, userIdsOfTenant, create, update, remove, saveMeasurement, decrypt,
+  tenantIdsForUser, defaultTenantFor, canAccess, tagMapFor, refreshTagMaps, setUserTenants, userIdsOfTenant, create, update, remove, saveMeasurement, decrypt,
 };
