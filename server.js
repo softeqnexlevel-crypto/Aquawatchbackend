@@ -10,7 +10,7 @@ const express = require("express");
 const cors = require("cors");
 const { Server } = require("socket.io");
 
-const { initMqtt, getStatus, closeMqtt } = require("./mqtt/mqttClient");
+const { initMqtt, getStatus } = require("./mqtt/mqttClient");
 const {
   initSocket,
   broadcastMqttStatus,
@@ -29,9 +29,9 @@ const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
   "http://localhost:3001",
-  "http://localhost:8081",   // Expo web preview
-  "http://localhost:19006",  // Expo web (older port)
+  "http://localhost:8081"
 ];
+
 
 const corsOptions = {
   origin: (origin, callback) => {
@@ -67,7 +67,6 @@ app.locals.dbReady = false;
 
 // ==================== API ROUTES ====================
 
-app.use("/api/daily-summary", require("./routes/dailySummary.routes"));
 app.use("/api", apiRoutes);
 
 // ==================== 404 HANDLER ====================
@@ -113,13 +112,11 @@ const io = new Server(server, {
   // --------------------------------------------------
   try {
     await initDb();
-    try { await require("./services/dailySummary").start(); } catch (e) { console.error("[dailySummary] start failed:", e.message); }
     app.locals.dbReady = true;
     console.log("[db] Database initialized successfully");
 
     // Seed/default users only after the database is ready.
     await authService.initUsers();
-    await require("./services/tenants.service").ensureTables();
   } catch (err) {
     app.locals.dbReady = false;
     console.error("========================================");
@@ -154,7 +151,7 @@ const io = new Server(server, {
   // pipeline) so it always has access to the live PLC tag store.
   // Do NOT start a second notifier here — that would double-send emails.
   try {
-    await initMqtt(); // one connection per client (tenant), settings read from the database
+    initMqtt();
   } catch (err) {
     console.error("[mqtt] init FAILED:", err);
   }
@@ -164,7 +161,7 @@ const io = new Server(server, {
   // --------------------------------------------------
   setInterval(() => {
     try {
-      for (const id of require("./mqtt/mqttClient").activeTenantIds()) broadcastMqttStatus(id);
+      broadcastMqttStatus();
     } catch (err) {
       console.error("[mqtt-status] broadcast error:", err.message);
     }
@@ -209,37 +206,10 @@ server.on("error", (err) => {
 
 // ==================== GRACEFUL SHUTDOWN ====================
 
-let shuttingDown = false;
-
 function shutdown(signal) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-
   console.log(
     `\n[server] ${signal} received — shutting down gracefully...`
   );
-
-  // Safety net: never wait more than 5 seconds for connections to drain.
-  setTimeout(() => {
-    console.warn("[server] Shutdown timed out — forcing exit");
-    process.exit(0);
-  }, 5000);
-
-  // Stop receiving PLC data first so a leftover copy can't keep
-  // processing packets or sending alert emails.
-  try {
-    closeMqtt();
-  } catch (err) {
-    console.error("[server] error closing MQTT:", err.message);
-  }
-
-  // Disconnect Socket.IO clients (this also closes the HTTP server).
-  try {
-    io.close();
-  } catch (err) {
-    console.error("[server] error closing Socket.IO:", err.message);
-  }
-
   server.close(() => {
     console.log("[server] Server closed");
     process.exit(0);
