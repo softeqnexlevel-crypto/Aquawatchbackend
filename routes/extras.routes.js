@@ -11,7 +11,7 @@ const tenants = require('../services/tenants.service');
 const MAIN = 1;
 
 const requireAuth = authMiddleware.requireAuth;
-const DEFAULTS = { feedTankCapacity: 300, flushTankCapacity: 200, emailAlertsEnabled: true };
+const DEFAULTS = { feedTankCapacity: 300, flushTankCapacity: 2, emailAlertsEnabled: true };
 
 async function ensureTable() {
     await db.getPool().query(`CREATE TABLE IF NOT EXISTS app_kv (key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())`);
@@ -117,14 +117,14 @@ router.get('/last-reading/:parameter', requireAuth, tenantContext, async (req, r
 const DAY_H = 24;
 async function readingsOf(tenantId, parameter, hours) {
     const sql = tenantId === MAIN
-        ? `SELECT time, value FROM measurements WHERE parameter = $1 AND time > NOW() - ($2::float * INTERVAL '1 hour') ORDER BY time`
-        : `SELECT time, value FROM tenant_measurements WHERE tenant_id = ${Number(tenantId)} AND parameter = $1 AND time > NOW() - ($2::float * INTERVAL '1 hour') ORDER BY time`;
+        ? `SELECT time, value FROM measurements WHERE (parameter = $1 OR parameter ILIKE '%' || $1) AND time > NOW() - ($2::float * INTERVAL '1 hour') ORDER BY time`
+        : `SELECT time, value FROM tenant_measurements WHERE tenant_id = ${Number(tenantId)} AND (parameter = $1 OR parameter ILIKE '%' || $1) AND time > NOW() - ($2::float * INTERVAL '1 hour') ORDER BY time`;
     return (await db.getPool().query(sql, [parameter, hours])).rows.map((r) => ({ t: new Date(r.time).getTime(), v: Number(r.value) })).filter((r) => Number.isFinite(r.v));
 }
 router.get('/tank-usage', requireAuth, tenantContext, async (req, res) => {
     try {
         const hours = Math.min(Math.max(Number(req.query.hours) || DAY_H, 1), 72);
-        let feedCap = 300, flushCap = 200;
+        let feedCap = 300, flushCap = 2;
         if (req.tenantId === MAIN) { const x = await readExtra(); feedCap = Number(x.feedTankCapacity) || feedCap; flushCap = Number(x.flushTankCapacity) || flushCap; }
         else { const c = tenants.mergeConfig((await tenants.getRow(req.tenantId) || {}).config); feedCap = Number(c.feedTankCapacity) || feedCap; flushCap = Number(c.flushTankCapacity) || flushCap; }
 

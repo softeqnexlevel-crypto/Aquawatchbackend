@@ -14,7 +14,7 @@ const DEFAULT_PAGES = [
   'system recovery', 'maintenance', 'analytics', 'reports', 'alerts',
 ];
 const DEFAULT_CONFIG = {
-  productionTarget: 1100, recoveryTarget: 70, feedTankCapacity: 300, flushTankCapacity: 200,
+  productionTarget: 1100, recoveryTarget: 70, feedTankCapacity: 300, flushTankCapacity: 2,
   pages: DEFAULT_PAGES,
   systems: [{ type: 'Reverse Osmosis', name: 'Reverse Osmosis', chemicals: ['Antiscalant'] }],
 };
