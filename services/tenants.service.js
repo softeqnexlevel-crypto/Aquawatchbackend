@@ -197,6 +197,9 @@ async function create({ name, mqtt, config }, userId) {
 async function update(id, patch) {
   const cur = await getRow(id);
   if (!cur) throw new Error('Tenant not found');
+  if (Number(id) === DEFAULT_TENANT_ID && patch.config && patch.config.tagMap !== undefined) {
+    throw new Error("The main plant's tag names are fixed and can't be changed");
+  }
   const sets = []; const vals = [];
   const add = (col, v, cast = '') => { vals.push(v); sets.push(`${col} = $${vals.length}${cast}`); };
   if (patch.name !== undefined) {
@@ -229,6 +232,7 @@ async function refreshTagMaps() {
     const rows = (await pool().query('SELECT id, config FROM tenants')).rows;
     tagMapCache.clear();
     for (const r of rows) {
+      if (Number(r.id) === DEFAULT_TENANT_ID) continue;   // the main plant always uses the standard names
       const m = (r.config && r.config.tagMap) || {};
       const inv = {};
       for (const [std, mine] of Object.entries(m)) if (mine) inv[String(mine)] = std;
@@ -237,7 +241,7 @@ async function refreshTagMaps() {
   } catch (e) { console.error('[tenants] tag map refresh', e.message); }
 }
 /** sync: { clientName: standardName } for one client ({} when none) */
-function tagMapFor(id) { return tagMapCache.get(Number(id)) || {}; }
+function tagMapFor(id) { return Number(id) === DEFAULT_TENANT_ID ? {} : (tagMapCache.get(Number(id)) || {}); }
 
 /** Delete a client and its stored readings. The original plant (1) can never be deleted. */
 async function remove(id) {
