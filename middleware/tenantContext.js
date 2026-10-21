@@ -7,7 +7,8 @@ const tenants = require('../services/tenants.service');
 async function tenantContext(req, res, next) {
   try {
     const raw = req.headers['x-tenant-id'] || (req.query && req.query.tenant);
-    const wanted = raw ? Number(raw) : tenants.DEFAULT_TENANT_ID;
+    const wanted = raw ? Number(raw) : await tenants.defaultTenantFor(req.user); // no header = the user's own client
+    if (wanted === null) return res.status(403).json({ error: 'No client is assigned to this login' });
     if (!Number.isInteger(wanted) || wanted < 1) return res.status(400).json({ error: 'Invalid tenant' });
     if (!(await tenants.canAccess(req.user, wanted))) return res.status(403).json({ error: 'You do not have access to this client' });
     req.tenantId = wanted;

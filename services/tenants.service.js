@@ -113,6 +113,12 @@ async function tenantIdsForUser(user) {
   const live = await pool().query('SELECT id FROM tenants WHERE id = ANY($1::int[])', [raw.rows.map((x) => x.tenant_id)]);
   return live.rows.map((x) => x.id);
 }
+/** The client a user lands on when none is chosen: tenant 1 if they may open it, else their lowest allowed id. null = none left. */
+async function defaultTenantFor(user) {
+  const ids = (await tenantIdsForUser(user)).map(Number).sort((a, b) => a - b);
+  if (!ids.length) return null;
+  return ids.includes(DEFAULT_TENANT_ID) ? DEFAULT_TENANT_ID : ids[0];
+}
 async function canAccess(user, tenantId) {
   if (!user) return false;
   return (await tenantIdsForUser(user)).includes(Number(tenantId));
@@ -224,5 +230,5 @@ async function saveMeasurement(tenantId, m) {
 
 module.exports = {
   DEFAULT_TENANT_ID, DEFAULT_PAGES, ensureTables, listAll, getRow, publicTenant, mergeConfig,
-  tenantIdsForUser, canAccess, setUserTenants, userIdsOfTenant, create, update, remove, saveMeasurement, decrypt,
+  tenantIdsForUser, defaultTenantFor, canAccess, setUserTenants, userIdsOfTenant, create, update, remove, saveMeasurement, decrypt,
 };

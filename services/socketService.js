@@ -39,12 +39,15 @@ function initSocket(io) {
       if (!user.isActive) return next(new Error('ACCOUNT_PAUSED'));
       socket.data.userId = user.id;
       // Which plant is this browser looking at? Only a tenant the user may open is accepted.
-      const wanted = Number(socket.handshake.auth && socket.handshake.auth.tenantId) || DEFAULT_TENANT_ID;
+      const asked = Number(socket.handshake.auth && socket.handshake.auth.tenantId) || 0;
       try {
         const tenants = require('./tenants.service');
-        socket.data.tenantId = (await tenants.canAccess(user, wanted)) ? wanted : DEFAULT_TENANT_ID;
+        const own = await tenants.defaultTenantFor(user);
+        if (own === null) return next(new Error('NO_CLIENT'));
+        // a client login never falls back to another client's data: if the asked-for client isn't theirs, they get their own
+        socket.data.tenantId = asked && (await tenants.canAccess(user, asked)) ? asked : own;
       } catch (e) {
-        socket.data.tenantId = DEFAULT_TENANT_ID;
+        return next(new Error('AUTH_FAILED'));
       }
       return next();
     } catch (err) {
