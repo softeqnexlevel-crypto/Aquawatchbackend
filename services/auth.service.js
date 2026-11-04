@@ -172,7 +172,11 @@ class AuthService {
     // Register new user
     async register(userData) {
         const exists = await db.findUserByEmail(userData.email);
-        if (exists) throw new Error('User already exists');
+        if (exists && !exists.deletedAt) throw new Error('User already exists');
+        if (exists && exists.deletedAt) {
+            // A deleted account still holds this email: release it so the address can be used again.
+            await db.updateUser(exists.id, { email: `deleted+${Date.now()}+${exists.id}@removed.invalid` });
+        }
 
         const passwordHash = await bcrypt.hash(userData.password, 10);
         const user = await db.createUser({
@@ -313,6 +317,8 @@ class AuthService {
 
         const result = await db.deleteUser(id, false);
         if (!result) throw new Error('User not found');
+        // Free the email so the same address can be registered again later.
+        await db.updateUser(id, { email: `deleted+${Date.now()}+${id}@removed.invalid` });
         await db.revokeAllUserRefreshTokens(id);
         this._cutLiveConnections(id);
         return true;
