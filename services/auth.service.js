@@ -174,8 +174,8 @@ class AuthService {
         const exists = await db.findUserByEmail(userData.email);
         if (exists && !exists.deletedAt) throw new Error('User already exists');
         if (exists && exists.deletedAt) {
-            // A deleted account still holds this email: release it so the address can be used again.
-            await db.updateUser(exists.id, { email: `deleted+${Date.now()}+${exists.id}@removed.invalid` });
+            // Left over from an earlier "soft" delete: remove it completely so the email can be used again.
+            await this._purgeUser(exists.id);
         }
 
         const passwordHash = await bcrypt.hash(userData.password, 10);
@@ -191,6 +191,19 @@ class AuthService {
         });
 
         return toPublicUser(user);
+    }
+
+    // Remove a user row completely. If the database refuses (other records still point at the user),
+    // fall back to deactivating it and releasing the email so the address can still be reused.
+    async _purgeUser(id) {
+        try {
+            await db.revokeAllUserRefreshTokens(id);
+            await db.deleteUser(id, true);
+        } catch (err) {
+            console.error('[auth] hard delete failed, releasing the email instead:', err.message);
+            await db.deleteUser(id, false);
+            await db.updateUser(id, { email: `deleted+${Date.now()}+${id}@removed.invalid` });
+        }
     }
 
     // Disconnect the user's open live-data (Socket.IO) connections
@@ -315,12 +328,8 @@ class AuthService {
             throw new Error('At least one active admin must remain');
         }
 
-        const result = await db.deleteUser(id, false);
-        if (!result) throw new Error('User not found');
-        // Free the email so the same address can be registered again later.
-        await db.updateUser(id, { email: `deleted+${Date.now()}+${id}@removed.invalid` });
-        await db.revokeAllUserRefreshTokens(id);
         this._cutLiveConnections(id);
+        await this._purgeUser(id);
         return true;
     }
 
