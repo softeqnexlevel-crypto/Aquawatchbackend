@@ -105,6 +105,12 @@ function analyzeRunCycles(readings, nowMs = Date.now()) {
   for (const { t, v } of readings) {
     if (!Number.isFinite(v) || v < 0 || v > 24) continue;
     if (max === null) { max = v; startAt = t - v * HOUR_MS; continue; }
+    // A real reset restarts the counter from 0, so within 2 h of a "reset" it can never read ABOVE the value
+    // it had before. If it does, that "reset" was only a burst of stray zeros from the gateway: undo it.
+    if (!pending && cycles.length) {
+      const last = cycles[cycles.length - 1];
+      if (v > last.max && t - last.resetAt <= 2 * HOUR_MS) { startAt = last.startAt; max = v; cycles.pop(); continue; }
+    }
     if (pending) {
       if (v >= pending.max) { max = v; pending = null; continue; }            // came back up: it was a glitch
       if (t - pending.at >= lowRepeatMs(pending.at)) {                                  // still low later: real reset
@@ -169,7 +175,9 @@ async function trackRunHours(run) {
   if (cycleMax === null) { cycleMax = run; cycleStartAt = now - run * HOUR_MS; }
   else if (pendingReset) {
     if (run >= pendingReset.max) { cycleMax = run; pendingReset = null; }      // glitch: value came back
-    else if (now - pendingReset.at >= confirmMs(pendingReset.at)) {                       // still low: real reset
+    // Real reset = the counter restarts and then counts up from a low, non-zero value (0 -> 1 -> 2 ...), or it has
+    // stayed at 0 for 2 h, or it happened at the PLC's own midnight. A burst of stray zeros is none of these.
+    else if ((run > 0 && run < pendingReset.max) || now - pendingReset.at >= (nearPlcMidnight(pendingReset.at) ? confirmMs(pendingReset.at) : 2 * HOUR_MS)) {
       const day = labelForReset(pendingReset.at);
       await saveRunLabel(day, pendingReset.max);
       console.log(`[dailySummary] counter reset detected - saved ${pendingReset.max}h for ${day}`);
