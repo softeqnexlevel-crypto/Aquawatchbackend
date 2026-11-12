@@ -118,11 +118,11 @@ class AlertNotifier {
       source: 'derived',
       severity: 'Critical',
       message: 'System Data Lost',
-      equipment: 'RO5 - MQTT Link',
+      equipment: 'RO5 - Data Link',
       value: `${secs}s since last data`,
       threshold: `> ${Math.round(config.staleMs / 1000)}s`,
       description:
-        'R05 plant has stopped sending data. Please check power and internet at the plant. ' +
+        `${config.plantName} plant has stopped sending data. Please check power and internet at the plant. ` +
         'Other alerts are paused until data resumes.',
     };
   }

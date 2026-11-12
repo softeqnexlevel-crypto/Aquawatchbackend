@@ -115,7 +115,7 @@ async function sendTiered({ subject, text, html, label }, tiers) {
 
   if (tiers.staff.length) {
     try {
-      await withRetry(() => getMailer().sendMail({ from, to: from, bcc: tiers.staff, subject, text, html }));
+      await withRetry(() => getMailer().sendMail({ from, to: config.email.mainTo || from, bcc: tiers.staff, subject, text, html }));
       console.log(`[channels] ${label} email sent to ${tiers.staff.length} staff recipient(s)`);
     } catch (err) {
       errors.push(err);
@@ -127,7 +127,7 @@ async function sendTiered({ subject, text, html, label }, tiers) {
     const slot = await claimClientEmailSlot();
     if (slot.ok) {
       try {
-        await withRetry(() => getMailer().sendMail({ from, to: from, bcc: tiers.clients, subject, text, html }));
+        await withRetry(() => getMailer().sendMail({ from, to: config.email.mainTo || from, bcc: tiers.clients, subject, text, html }));
         console.log(`[channels] ${label} email sent to ${tiers.clients.length} client(s) (${slot.used}/${CLIENT_MAX_PER_DAY} today)`);
       } catch (err) {
         await releaseClientEmailSlot();
@@ -151,7 +151,7 @@ function buildEmailContent(sorted) {
   const isReminder = sorted.every((t) => t.reminder);
 
   const subject = isReminder
-    ? `RO Plant Reminder ${top.title}`
+    ? `${config.plantName} Plant Reminder: ${top.title}`
     : sorted.length === 1
       ? `${config.plantName} Plant Alert: ${top.title}`
       : `${config.plantName} Plant Alert: ${sorted.length} new alerts`;
@@ -186,6 +186,7 @@ function buildEmailContent(sorted) {
 
 async function sendInBatches(list, content) {
   const { from } = config.email;
+  const { subject, text, html } = content;
   const batches = [];
   for (let i = 0; i < list.length; i += EMAIL_BATCH_SIZE) {
     batches.push(list.slice(i, i + EMAIL_BATCH_SIZE));
@@ -195,7 +196,7 @@ async function sendInBatches(list, content) {
   for (const bcc of batches) {
     try {
       // "to" is the sender; the real recipients are all in BCC.
-      await withRetry(() => getMailer().sendMail({ from, to: from, bcc, ...content }));
+      await withRetry(() => getMailer().sendMail({ from, to: config.email.mainTo || from, bcc, subject, text, html }));
     } catch (err) {
       failed += 1;
       console.error(`[channels] email batch of ${bcc.length} failed: ${err.message}`);
@@ -261,7 +262,7 @@ async function sendClearedEmail(info) {
   if (!tiers.staff.length) return;
 
   const { title, severity, equipment, startedAt, clearedAt, minutes } = info;
-  const subject = `RO Plant Cleared ${title}`;
+  const subject = `${config.plantName} Plant Cleared: ${title}`;
   const text =
 `[${severity || 'Info'}] ${title} has cleared.
 ${equipment ? `Equipment: ${equipment}\n` : ''}Raised: ${fmtTime(new Date(startedAt))}
@@ -402,7 +403,7 @@ async function sendTankEmptyNotification(info) {
     startedAt.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
 
   if ((tiers.staff.length || tiers.clients.length) && config.email.enabled !== false) {
-    const subject = '${config.plantName} Plant Alert: Feed Tank Low';
+    const subject = `${config.plantName} Plant Alert: Feed Tank Low`;
 
     const text =
 `${title}
@@ -440,10 +441,10 @@ async function sendBackwashNotification(info) {
 
   const title = 'System in Backwash Mode';
   const message =
-   `The ${config.plantName} plant has switched to backwash mode. ` +
-`The media filter pressure is high, the system is cleaning the filter` +
-(mediaPressure !== undefined ? ` (${Number(mediaPressure).toFixed(2)} bar)` : '') +
-(previousMode ? `. Previous mode: ${previousMode}.` : '.');
+    `The ${config.plantName} plant has switched to backwash mode. ` +
+    `The media filter pressure is high, so the system is cleaning the filter` +
+    (mediaPressure !== undefined ? ` (${Number(mediaPressure).toFixed(2)} bar)` : '') +
+    (previousMode ? `. Previous mode: ${previousMode}.` : '.');
 
    const tiers = await resolveTiers();
   const { from } = config.email;

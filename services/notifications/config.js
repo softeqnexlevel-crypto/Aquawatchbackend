@@ -36,6 +36,7 @@ module.exports = {
   //   *_ONLY_TYPES    → channel handles ONLY these alerts (empty = all)
   //   *_EXCLUDE_TYPES → channel never handles these alerts
   email: {
+    mainTo: process.env.ALERT_EMAIL_MAIN_TO || 'aquasystemtech.co.ke@gmail.com',
     enabled: process.env.EMAIL_ENABLED !== 'false',
     minSeverity: sev(process.env.EMAIL_MIN_SEVERITY, 'Low'),
     onlyTypes: typeList(process.env.EMAIL_ONLY_TYPES),
