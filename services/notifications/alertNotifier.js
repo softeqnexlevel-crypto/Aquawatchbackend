@@ -113,16 +113,16 @@ class AlertNotifier {
   dataLostCandidate(stale) {
     const secs = Math.round((Date.now() - this.lastMessageAt) / 1000);
     return {
-      id: 'derived-plc-data-lost',
+      id: 'derived-system-data-lost',
       active: stale,
       source: 'derived',
       severity: 'Critical',
-      message: 'PLC Data Lost',
+      message: 'System Data Lost',
       equipment: 'RO5 - MQTT Link',
       value: `${secs}s since last data`,
       threshold: `> ${Math.round(config.staleMs / 1000)}s`,
       description:
-        'No data received from the PLC/ABox over MQTT. ' +
+        'R05 plant has stopped sending data. Please check power and internet at the plant. ' +
         'Other alerts are paused until data resumes.',
     };
   }
@@ -376,7 +376,7 @@ class AlertNotifier {
         this.confirmTimers.delete(c.id);
 
         const stillActive =
-          c.id === 'derived-plc-data-lost'
+          c.id === 'derived-system-data-lost'
             ? Date.now() - this.lastMessageAt > config.staleMs
             : this.activeIds.has(c.id);
 

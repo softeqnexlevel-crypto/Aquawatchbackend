@@ -10,7 +10,7 @@ const sev = (v, d) => (SEVERITIES.includes(v) ? v : d);
 
 module.exports = {
   SEVERITIES,
-
+  plantName: process.env.PLANT_NAME || 'RO5',
   enabled: process.env.ALERT_NOTIFIER_ENABLED !== 'false',
   // Path to the SHARED alertEngine file (absolute, or relative to the backend root).
   enginePath: process.env.ALERT_ENGINE_PATH,

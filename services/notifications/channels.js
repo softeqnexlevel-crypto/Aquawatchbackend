@@ -153,8 +153,8 @@ function buildEmailContent(sorted) {
   const subject = isReminder
     ? `RO Plant Reminder ${top.title}`
     : sorted.length === 1
-      ? `RO Plant Alert ${top.title}`
-      : `RO Plant Alert ${sorted.length} new alerts`;
+      ? `${config.plantName} Plant Alert: ${top.title}`
+      : `${config.plantName} Plant Alert: ${sorted.length} new alerts`;
 
   const when = (t) => (t.reminder ? 'Still active since' : 'Raised');
 
@@ -388,7 +388,7 @@ async function sendTankEmptyNotification(info) {
 
   const title = 'Water Tank Low — System on Standby mode';
   const message =
-    `The RO plant is currently in standby mode and the water tank is Low. ` +
+    `The ${config.plantName} plant is currently in standby mode and the water tank is Low. ` +
     `Please check the tank level and water supply.` +
     (tankLevel !== undefined ? ` Current tank level: ${Number(tankLevel).toFixed(1)}%.` : '') +
     (currentMode ? ` Current mode: ${currentMode}.` : '');
@@ -402,7 +402,7 @@ async function sendTankEmptyNotification(info) {
     startedAt.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
 
   if ((tiers.staff.length || tiers.clients.length) && config.email.enabled !== false) {
-    const subject = 'RO Plant Alert- Feed Tank Low';
+    const subject = '${config.plantName} Plant Alert: Feed Tank Low';
 
     const text =
 `${title}
@@ -440,10 +440,10 @@ async function sendBackwashNotification(info) {
 
   const title = 'System in Backwash Mode';
   const message =
-    `The RO plant has switched to backwash Mode. ` +
-    `Media filter Differential pressure is high, system is backwashing` +
-    (mediaPressure !== undefined ? ` (${Number(mediaPressure).toFixed(2)} bar)` : '') +
-    (previousMode ? `. Previous mode: ${previousMode}.` : '.');
+   `The ${config.plantName} plant has switched to backwash mode. ` +
+`The media filter pressure is high, the system is cleaning the filter` +
+(mediaPressure !== undefined ? ` (${Number(mediaPressure).toFixed(2)} bar)` : '') +
+(previousMode ? `. Previous mode: ${previousMode}.` : '.');
 
    const tiers = await resolveTiers();
   const { from } = config.email;
@@ -454,7 +454,7 @@ async function sendBackwashNotification(info) {
     startedAt.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
 
   if ((tiers.staff.length || tiers.clients.length) && config.email.enabled !== false) {
-    const subject = `RO Plant: ${title}`;
+    const subject = `${config.plantName} Plant: ${title}`;
 
     const text =
 `${title}

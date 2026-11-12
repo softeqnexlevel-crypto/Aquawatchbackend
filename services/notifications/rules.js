@@ -38,7 +38,7 @@ function evaluateBackwashFilterDpAlert(get) {
   const dpHigh = dpKnown && dp >= config.filterDpLimitBar;
 
   const trigger = plcBit
-    ? 'PLC high filter ΔP bit is set'
+    ? 'High filter pressure reported'
     : dpHigh
       ? `Filter ΔP at or above ${config.filterDpLimitBar.toFixed(2)} bar`
       : 'Backwash cycle running';
@@ -51,7 +51,7 @@ function evaluateBackwashFilterDpAlert(get) {
     active,
     source: 'derived',
     equipment: 'RO5 - Media Filter',
-    description: `System in backwash mode — ${trigger}`,
+    description: `R05 plant in backwash mode — ${trigger}`,
     // Only show a reading when it is actually high ("exceeded limit" wording in the UI)
     value: (plcBit || dpHigh) && dpKnown ? `${dp.toFixed(2)} bar` : undefined,
     threshold: `≥ ${config.filterDpLimitBar.toFixed(2)} bar`,
