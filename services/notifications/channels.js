@@ -387,9 +387,9 @@ async function sendTankEmptyNotification(info) {
   const { startedAt, tankLevel, currentMode } = info;
   const timeStr = fmtTime(startedAt);
 
-  const title = 'Water Tank Low — System on Standby mode';
+  const title = 'RO5 Plant System on Standby mode';
   const message =
-    `The ${config.plantName} plant is currently in standby mode and the water tank is Low. ` +
+    `The ${config.plantName} plant is currently in standby mode, the water tank is Low. ` +
     `Please check the tank level and water supply.` +
     (tankLevel !== undefined ? ` Current tank level: ${Number(tankLevel).toFixed(1)}%.` : '') +
     (currentMode ? ` Current mode: ${currentMode}.` : '');
@@ -439,10 +439,10 @@ async function sendBackwashNotification(info) {
   const { startedAt, mediaPressure, previousMode } = info;
   const timeStr = fmtTime(startedAt);
 
-  const title = 'System in Backwash Mode';
+  const title = 'RO5 Plant System in Backwash Mode';
   const message =
     `The ${config.plantName} plant has switched to backwash mode. ` +
-    `The media filter pressure is high, so the system is cleaning the filter` +
+    `Media filter differential pressure is high, the system is cleaning the filter` +
     (mediaPressure !== undefined ? ` (${Number(mediaPressure).toFixed(2)} bar)` : '') +
     (previousMode ? `. Previous mode: ${previousMode}.` : '.');
 
