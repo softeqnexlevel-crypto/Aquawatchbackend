@@ -7,6 +7,49 @@ const { rank, esc, withRetry, actionFor, slug } = require('./util');
 
 const fmtTime = (d) => d.toLocaleString('en-GB', { timeZone: config.calendar.timeZone });
 
+// ───────────────────────── Email layout ─────────────────────────
+// One professional layout for every alert email.
+// item = { title, message, rows: [[label, value], ...], action, reminder }
+function renderEmail(items) {
+  const rowsOf = (it) => (it.rows || []).filter(([, v]) => v !== undefined && v !== null && v !== '');
+
+  const text =
+    items
+      .map((it) =>
+        [
+          `${it.title}${it.reminder ? ' (Reminder: this alert is still active)' : ''}`,
+          '',
+          it.message || '',
+          '',
+          ...(it.summary ? [it.summary] : []),
+          ...(it.summary ? rowsOf(it).map(([k, v]) => `${k}: ${v}`) : rowsOf(it).map(([k, v]) => `${k}: ${v}`)),
+          ...(it.action ? ['', `Recommended action: ${it.action}`] : []),
+        ].join('\n')
+      )
+      .join('\n\n----------------------------------------\n\n');
+
+  const html = `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1f2937;max-width:600px">${items
+    .map(
+      (it) => `
+<div style="border:1px solid #e5e7eb;border-radius:8px;padding:16px 18px;margin-bottom:14px">
+  <div style="font-size:16px;font-weight:600;color:#111827">${esc(it.title)}</div>
+  ${it.reminder ? '<div style="font-size:12px;color:#b45309;margin-top:2px">Reminder: this alert is still active</div>' : ''}
+  ${it.message ? `<div style="margin-top:10px;line-height:1.5;color:#374151">${esc(it.message)}</div>` : ''}
+  ${it.summary ? `<div style="margin-top:12px;font-size:14px;color:#111827">${esc(it.summary)}</div>` : ''}
+  <table style="margin-top:${it.summary ? 4 : 12}px;font-size:13px;color:#374151;border-collapse:collapse">
+    ${rowsOf(it)
+      .map(([k, v]) => `<tr><td style="padding:2px 16px 2px 0;color:#6b7280;vertical-align:top">${esc(k)}</td><td style="padding:2px 0">${esc(v)}</td></tr>`)
+      .join('')}
+  </table>
+  ${it.action ? `<div style="margin-top:12px;font-size:13px"><b>Recommended action</b><br>${esc(it.action)}</div>` : ''}
+</div>`
+    )
+    .join('')}
+</div>`;
+
+  return { text, html };
+}
+
 // ───────────────────────── Email (nodemailer) ─────────────────────────
 let mailer;
 function getMailer() {
@@ -156,30 +199,20 @@ function buildEmailContent(sorted) {
       ? `${config.plantName} Plant Alert: ${top.title}`
       : `${config.plantName} Plant Alert: ${sorted.length} new alerts`;
 
-  const when = (t) => (t.reminder ? 'Still active since' : 'Raised');
-
-  const text = sorted
-    .map(
-      (t) =>
-`• [${t.severity}] ${t.title}${t.reminder ? ' (REMINDER - still active)' : ''}
-  ${t.message || t.equipment || ''}${t.value !== undefined ? ` (value: ${t.value})` : ''}
-  ${when(t)}: ${fmtTime(t.startedAt)}
-  Maintenance task: ${t.action}
-  Ref: ${t.cycleId}`
-    )
-    .join('\n\n');
-
-  const html = `<div style="font-family:sans-serif;font-size:14px">${sorted
-    .map(
-      (t) =>
-`<div style="margin-bottom:14px">
-  <b>[${esc(t.severity)}] ${esc(t.title)}${t.reminder ? ' <span style="color:#b45309">(REMINDER - still active)</span>' : ''}</b><br>
-  ${esc(t.message || t.equipment || '')}${t.value !== undefined ? ` <i>(value: ${esc(t.value)})</i>` : ''}<br>
-  <small>${esc(when(t))} ${esc(fmtTime(t.startedAt))} · Ref ${esc(t.cycleId)}</small><br>
-  <b>Maintenance task:</b> ${esc(t.action)}
-</div>`
-    )
-    .join('')}</div>`;
+  const { text, html } = renderEmail(
+    sorted.map((t) => ({
+      title: t.title,
+      message: t.message || '',
+      reminder: !!t.reminder,
+      summary:
+        `${config.plantName} ` +
+        `${String(t.equipment || '').replace(new RegExp(`^${config.plantName}\\s*-\\s*`, 'i'), '') || 'plant'}` +
+        `${t.value !== undefined ? ` reading ${t.value}` : ''}, ` +
+        `${t.reminder ? 'active since' : 'raised'} ${fmtTime(t.startedAt)}.`,
+      rows: [['Reference', t.cycleId]],
+      action: t.action,
+    }))
+  );
 
   return { subject, text, html };
 }
@@ -262,15 +295,20 @@ async function sendClearedEmail(info) {
   if (!tiers.staff.length) return;
 
   const { title, severity, equipment, startedAt, clearedAt, minutes } = info;
-  const subject = `${config.plantName} Plant Cleared: ${title}`;
-  const text =
-`[${severity || 'Info'}] ${title} has cleared.
-${equipment ? `Equipment: ${equipment}\n` : ''}Raised: ${fmtTime(new Date(startedAt))}
-Cleared: ${fmtTime(new Date(clearedAt))}${minutes ? ` (after ${minutes} min)` : ''}`;
-  const html = `<div style="font-family:sans-serif;font-size:14px">
-  <b>[${esc(severity || 'Info')}] ${esc(title)} has cleared.</b><br>
-  ${equipment ? `${esc(equipment)}<br>` : ''}<small>Raised ${esc(fmtTime(new Date(startedAt)))} · Cleared ${esc(fmtTime(new Date(clearedAt)))}${minutes ? ` (after ${minutes} min)` : ''}</small>
-</div>`;
+  const subject = `${config.plantName} Plant Resolved: ${title}`;
+  const { text, html } = renderEmail([
+    {
+      title: `${title} - Resolved`,
+      message: 'This alert has cleared and the plant is back to normal.',
+      rows: [
+        ['Plant', config.plantName],
+        ['Equipment', equipment],
+        ['Raised', fmtTime(new Date(startedAt))],
+        ['Cleared', fmtTime(new Date(clearedAt))],
+        ['Duration', minutes ? `${minutes} min` : undefined],
+      ],
+    },
+  ]);
 
   await sendInBatches(tiers.staff, { subject, text, html });
 }
@@ -387,10 +425,12 @@ async function sendTankEmptyNotification(info) {
   const { startedAt, tankLevel, currentMode } = info;
   const timeStr = fmtTime(startedAt);
 
-  const title = 'RO5 Plant System on Standby mode';
+  const title = 'Water Tank Low — System on Standby mode';
+  const emailMessage =
+    `The ${config.plantName} plant is on standby and the feed tank level is low. ` +
+    `Please check the water supply.`;
   const message =
-    `The ${config.plantName} plant is currently in standby mode, the water tank is Low. ` +
-    `Please check the tank level and water supply.` +
+    emailMessage +
     (tankLevel !== undefined ? ` Current tank level: ${Number(tankLevel).toFixed(1)}%.` : '') +
     (currentMode ? ` Current mode: ${currentMode}.` : '');
 
@@ -405,21 +445,20 @@ async function sendTankEmptyNotification(info) {
   if ((tiers.staff.length || tiers.clients.length) && config.email.enabled !== false) {
     const subject = `${config.plantName} Plant Alert: Feed Tank Low`;
 
-    const text =
-`${title}
-
-${message}
-
-Raised: ${timeStr}
-Ref: ${ref}
-Maintenance task: ${action}`;
-
-    const html = `<div style="font-family:sans-serif;font-size:14px;line-height:1.5;color:#1f2937">
-  <div style="font-weight:600;font-size:15px;color:#111827">${esc(title)}</div>
-  <div style="color:#4b5563;margin-top:6px">${esc(message)}</div>
-  <div style="font-size:12px;color:#6b7280;margin-top:8px">Raised ${esc(timeStr)} · Ref ${esc(ref)}</div>
-  <div style="margin-top:8px"><b>Maintenance task:</b> ${esc(action)}</div>
-</div>`;
+    const { text, html } = renderEmail([
+      {
+        title: 'Feed Tank Low',
+        message: emailMessage,
+        rows: [
+          ['Plant', config.plantName],
+          ['Equipment', 'Feed Tank'],
+          ['Tank level', tankLevel !== undefined ? `${Number(tankLevel).toFixed(1)}%` : undefined],
+          ['Raised', timeStr],
+          ['Reference', ref],
+        ],
+        action,
+      },
+    ]);
 
     await sendTiered({ subject, text, html, label: 'tank-empty' }, tiers);
   } else {
@@ -439,10 +478,13 @@ async function sendBackwashNotification(info) {
   const { startedAt, mediaPressure, previousMode } = info;
   const timeStr = fmtTime(startedAt);
 
-  const title = 'RO5 Plant System in Backwash Mode';
+  const title = 'System in Backwash Mode';
+  const emailMessage =
+    `The ${config.plantName} plant has switched to backwash mode. ` +
+    `The media filter pressure is high, so the system is cleaning the filter.`;
   const message =
     `The ${config.plantName} plant has switched to backwash mode. ` +
-    `Media filter differential pressure is high, the system is cleaning the filter` +
+    `The media filter pressure is high, so the system is cleaning the filter` +
     (mediaPressure !== undefined ? ` (${Number(mediaPressure).toFixed(2)} bar)` : '') +
     (previousMode ? `. Previous mode: ${previousMode}.` : '.');
 
@@ -457,21 +499,21 @@ async function sendBackwashNotification(info) {
   if ((tiers.staff.length || tiers.clients.length) && config.email.enabled !== false) {
     const subject = `${config.plantName} Plant: ${title}`;
 
-    const text =
-`${title}
-
-${message}
-
-Raised: ${timeStr}
-Ref: ${ref}
-Maintenance task: ${action}`;
-
-    const html = `<div style="font-family:sans-serif;font-size:14px;line-height:1.5;color:#1f2937">
-  <div style="font-weight:600;font-size:15px;color:#111827">${esc(title)}</div>
-  <div style="color:#4b5563;margin-top:6px">${esc(message)}</div>
-  <div style="font-size:12px;color:#6b7280;margin-top:8px">Raised ${esc(timeStr)} · Ref ${esc(ref)}</div>
-  <div style="margin-top:8px"><b>Maintenance task:</b> ${esc(action)}</div>
-</div>`;
+    const { text, html } = renderEmail([
+      {
+        title,
+        message: emailMessage,
+        rows: [
+          ['Plant', config.plantName],
+          ['Equipment', 'Media Filter'],
+          ['Filter pressure', mediaPressure !== undefined ? `${Number(mediaPressure).toFixed(2)} bar` : undefined],
+          ['Previous mode', previousMode],
+          ['Raised', timeStr],
+          ['Reference', ref],
+        ],
+        action,
+      },
+    ]);
 
     await sendTiered({ subject, text, html, label: 'backwash' }, tiers);
   } else {
