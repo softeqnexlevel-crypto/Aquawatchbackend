@@ -8,6 +8,8 @@ const path = require('path');
 // Order: 1) PASETO_KEY environment variable (base64, 32 bytes)  <- use this on Render
 //        2) the .paseto-key file (fine on your own computer, but Render's disk is wiped on every deploy)
 //        3) a new random key (last resort; a warning is printed because everyone is signed out on restart)
+let KEY_SOURCE = 'unknown';
+
 function loadKey() {
     const fromEnv = (process.env.PASETO_KEY || '').trim();
     if (fromEnv) {
@@ -16,6 +18,7 @@ function loadKey() {
             throw new Error('PASETO_KEY must be 32 random bytes encoded as base64 (44 characters). ' +
                 'Create one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64\'))"');
         }
+        KEY_SOURCE = 'environment variable PASETO_KEY';
         return key;
     }
 
@@ -23,20 +26,33 @@ function loadKey() {
     try {
         if (fs.existsSync(keyFile)) {
             const key = Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'base64');
-            if (key.length === 32) return key;
+            if (key.length === 32) { KEY_SOURCE = 'file .paseto-key'; return key; }
         }
     } catch (_) { /* fall through */ }
 
     const key = crypto.randomBytes(32);
     try { fs.writeFileSync(keyFile, key.toString('base64')); } catch (_) { /* read-only disk */ }
+    KEY_SOURCE = 'TEMPORARY random key';
     console.warn('[auth] ⚠️ PASETO_KEY is not set: using a temporary signing key. ' +
         'Every login will stop working the next time the server restarts. Set PASETO_KEY in your hosting environment.');
     return key;
 }
 
+// Why a token was refused, without ever printing the token or the key.
+// Repeated identical reasons are printed at most once a minute.
+const lastLogged = new Map();
+function logReject(kind, reason) {
+    const k = `${kind}:${reason}`;
+    const now = Date.now();
+    if (now - (lastLogged.get(k) || 0) < 60000) return;
+    lastLogged.set(k, now);
+    console.warn(`[auth] ${kind} token refused: ${reason}`);
+}
+
 class PasetoService {
     constructor() {
         this.key = loadKey();
+        console.log(`[auth] signing key source: ${KEY_SOURCE}`);
     }
 
     async generateAccessToken(user) {
@@ -70,10 +86,11 @@ class PasetoService {
     async verifyAccessToken(token) {
         try {
             const payload = await V3.decrypt(token, this.key);
-            if (payload.type !== 'access') return null;
-            if (new Date(payload.exp) < new Date()) return null;
+            if (payload.type !== 'access') { logReject('access', 'wrong token type'); return null; }
+            if (new Date(payload.exp) < new Date()) { logReject('access', 'expired'); return null; }
             return payload;
         } catch (error) {
+            logReject('access', error && (error.code || error.message) || 'could not be decrypted (wrong key or damaged token)');
             return null;
         }
     }
@@ -81,10 +98,11 @@ class PasetoService {
     async verifyRefreshToken(token) {
         try {
             const payload = await V3.decrypt(token, this.key);
-            if (payload.type !== 'refresh') return null;
-            if (new Date(payload.exp) < new Date()) return null;
+            if (payload.type !== 'refresh') { logReject('refresh', 'wrong token type'); return null; }
+            if (new Date(payload.exp) < new Date()) { logReject('refresh', 'expired'); return null; }
             return payload;
         } catch (error) {
+            logReject('refresh', error && (error.code || error.message) || 'could not be decrypted (wrong key or damaged token)');
             return null;
         }
     }
